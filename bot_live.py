@@ -305,16 +305,30 @@ def handle_commands():
 def init_clob():
     global clob_client
     if not POLY_AVAILABLE:
-        tg("❌ <b>py-clob-client not installed!</b>\nAdd to requirements.txt")
+        tg("❌ <b>py-clob-client not installed!</b>")
         return False
     if not POLY_PRIVATE_KEY:
-        tg("❌ <b>POLY_PRIVATE_KEY missing!</b>\nAdd to Railway env vars")
+        tg("❌ <b>POLY_PRIVATE_KEY missing!</b>")
         return False
     try:
         host = "https://clob.polymarket.com"
         chain_id = POLYGON
-        clob_client = ClobClient(host, key=POLY_PRIVATE_KEY, chain_id=chain_id)
-        # Generate API credentials (cached after first call)
+        funder = os.environ.get("POLY_FUNDER", "")
+        sig_type = int(os.environ.get("POLY_SIG_TYPE", "1"))
+        
+        if funder:
+            # Email/Magic wallet with separate funder
+            clob_client = ClobClient(
+                host,
+                key=POLY_PRIVATE_KEY,
+                chain_id=chain_id,
+                signature_type=sig_type,
+                funder=funder,
+            )
+        else:
+            # EOA/standard wallet
+            clob_client = ClobClient(host, key=POLY_PRIVATE_KEY, chain_id=chain_id)
+        
         clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
         log.info("CLOB client initialized")
         return True
@@ -333,16 +347,14 @@ def check_balance(force=False):
     if not clob_client:
         return 0.0
     try:
-        # The actual API call depends on py-clob-client version
-        # Trying common methods
-        balance_response = clob_client.get_balance_allowance({
-            "asset_type": "COLLATERAL",
-        })
-        # Response is in raw USDC units (6 decimals)
-        if isinstance(balance_response, dict) and "balance" in balance_response:
-            state["balance_usd"] = float(balance_response["balance"]) / 1_000_000
-        elif hasattr(balance_response, "balance"):
-            state["balance_usd"] = float(balance_response.balance) / 1_000_000
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        balance_response = clob_client.get_balance_allowance(params)
+        if isinstance(balance_response, dict):
+            bal_raw = balance_response.get("balance", 0)
+        else:
+            bal_raw = getattr(balance_response, "balance", 0)
+        state["balance_usd"] = float(bal_raw) / 1_000_000
         state["last_balance_check"] = now
         log.info(f"Balance: ${state['balance_usd']:.2f}")
         return state["balance_usd"]
