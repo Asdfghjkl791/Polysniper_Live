@@ -310,32 +310,62 @@ def init_clob():
     if not POLY_PRIVATE_KEY:
         tg("❌ <b>POLY_PRIVATE_KEY missing!</b>")
         return False
-    try:
-        host = "https://clob.polymarket.com"
-        chain_id = POLYGON
-        funder = os.environ.get("POLY_FUNDER", "")
-        sig_type = int(os.environ.get("POLY_SIG_TYPE", "1"))
-        
-        if funder:
-            # Email/Magic wallet with separate funder
-            clob_client = ClobClient(
-                host,
-                key=POLY_PRIVATE_KEY,
-                chain_id=chain_id,
-                signature_type=sig_type,
-                funder=funder,
-            )
-        else:
-            # EOA/standard wallet
-            clob_client = ClobClient(host, key=POLY_PRIVATE_KEY, chain_id=chain_id)
-        
-        clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
-        log.info("CLOB client initialized")
-        return True
-    except Exception as e:
-        log.error(f"CLOB init failed: {e}")
-        tg(f"❌ <b>Polymarket connection failed</b>\n<code>{str(e)[:200]}</code>")
-        return False
+    
+    host = "https://clob.polymarket.com"
+    chain_id = POLYGON
+    funder_env = os.environ.get("POLY_FUNDER", "").strip()
+    
+    # Try different configurations to find what works
+    configs_to_try = []
+    
+    if funder_env:
+        # User explicitly set funder
+        configs_to_try.append({"sig_type": 1, "funder": funder_env, "name": "Email wallet (sig=1, custom funder)"})
+        configs_to_try.append({"sig_type": 2, "funder": funder_env, "name": "Proxy wallet (sig=2, custom funder)"})
+    
+    # Default fallbacks
+    configs_to_try.append({"sig_type": 0, "funder": None, "name": "Standard EOA (sig=0)"})
+    
+    for cfg in configs_to_try:
+        try:
+            log.info(f"Trying: {cfg['name']}")
+            if cfg["funder"]:
+                clob_client = ClobClient(
+                    host,
+                    key=POLY_PRIVATE_KEY,
+                    chain_id=chain_id,
+                    signature_type=cfg["sig_type"],
+                    funder=cfg["funder"],
+                )
+            else:
+                clob_client = ClobClient(host, key=POLY_PRIVATE_KEY, chain_id=chain_id)
+            
+            clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
+            
+            # Test by fetching balance
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            bal_resp = clob_client.get_balance_allowance(params)
+            if isinstance(bal_resp, dict):
+                bal_raw = bal_resp.get("balance", 0)
+            else:
+                bal_raw = getattr(bal_resp, "balance", 0)
+            bal_usd = float(bal_raw) / 1_000_000
+            
+            if bal_usd > 0:
+                log.info(f"✅ Config worked: {cfg['name']} - Balance: ${bal_usd:.2f}")
+                tg(f"✅ <b>Connected!</b>\nConfig: {cfg['name']}\n💰 ${bal_usd:.2f}")
+                state["balance_usd"] = bal_usd
+                state["last_balance_check"] = time.time()
+                return True
+            else:
+                log.info(f"Config {cfg['name']}: Balance $0, trying next")
+        except Exception as e:
+            log.warning(f"Config {cfg['name']} failed: {e}")
+            continue
+    
+    tg("❌ <b>All connection configs failed</b>\nCheck POLY_PRIVATE_KEY and POLY_FUNDER")
+    return False
 
 
 def check_balance(force=False):
