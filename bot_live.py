@@ -355,6 +355,9 @@ def init_clob():
             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             bal_resp = clob_client.get_balance_allowance(params)
+            log.info("DEBUG bal_resp type: " + str(type(bal_resp)))
+                        log.info("DEBUG bal_resp value: " + str(bal_resp)[:200])
+
             if isinstance(bal_resp, dict):
                 bal_raw = bal_resp.get("balance", 0)
             else:
