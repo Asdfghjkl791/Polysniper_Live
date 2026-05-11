@@ -315,6 +315,9 @@ def init_clob():
     chain_id = POLYGON
     funder_env = os.environ.get("POLY_FUNDER", "").strip()
     log.info("DEBUG funder_env length: " + str(len(funder_env)))
+    log.info("DEBUG poly_key length: " + str(len(POLY_PRIVATE_KEY)))
+    log.info("DEBUG poly_key starts: " + POLY_PRIVATE_KEY[:6])
+
     
     # Try different configurations to find what works
     configs_to_try = []
@@ -340,7 +343,12 @@ def init_clob():
                 )
             else:
                 clob_client = ClobClient(host, key=POLY_PRIVATE_KEY, chain_id=chain_id)
-            
+            try:
+                addr = clob_client.get_address()
+                log.info("DEBUG signer address: " + str(addr))
+            except Exception as e:
+                log.info("DEBUG get_address failed: " + str(e))
+
             clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
             
             # Test by fetching balance
