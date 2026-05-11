@@ -314,6 +314,7 @@ def init_clob():
     host = "https://clob.polymarket.com"
     chain_id = POLYGON
     funder_env = os.environ.get("POLY_FUNDER", "").strip()
+    log.info("DEBUG funder_env length: " + str(len(funder_env)))
     
     # Try different configurations to find what works
     configs_to_try = []
