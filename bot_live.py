@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v2.0 - Using py-clob-client-v2 for new deposit wallets
-# - signature_type=3 (POLY_1271) for email-signup accounts
-# - Diagnostic mode: connects, reads balance, no trading yet
-# - All times in EST
+# PolySniper LIVE v3.0 - Full Auto Trading
+# - BTC + ETH only, 5min + 15min timeframes
+# - $1 bet size, auto-stops after 1 loss
+# - Mirrors paper bot strategy (v4.1 settings)
+# - Uses py-clob-client-v2 with signature_type=3 (POLY_1271 deposit wallet)
 
 import os
 import time
+import sqlite3
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
+from collections import deque
 
 try:
-    from py_clob_client_v2 import ClobClient, OrderArgs, PartialCreateOrderOptions, ApiCreds
+    from py_clob_client_v2 import (
+        ClobClient, OrderArgs, PartialCreateOrderOptions,
+        BalanceAllowanceParams, AssetType, OrderType
+    )
     from py_clob_client_v2.order_builder.constants import BUY
     V2_AVAILABLE = True
     IMPORT_ERROR = None
@@ -19,174 +25,184 @@ except ImportError as e:
     V2_AVAILABLE = False
     IMPORT_ERROR = str(e)
 
+# ─── ENV VARS ─────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "").strip()
 POLY_FUNDER      = os.environ.get("POLY_FUNDER", "").strip()
 
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+ASSET_LIST = ["BTC", "ETH"]   # Only BTC + ETH for live
+TIMEFRAMES = [5, 15]
+
+ASSET_THRESHOLDS_5 = {
+    "BTC":  float(os.environ.get("THRESHOLD_BTC_5",  "0.08")),
+    "ETH":  float(os.environ.get("THRESHOLD_ETH_5",  "0.10")),
+}
+ASSET_THRESHOLDS_15 = {
+    "BTC":  float(os.environ.get("THRESHOLD_BTC_15", "0.15")),
+    "ETH":  float(os.environ.get("THRESHOLD_ETH_15", "0.20")),
+}
+
+MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "20"))
+MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "40"))
+
+CONFIG = {
+    "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
+    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "10")),
+    "momentum_checks":      int(os.environ.get("MOMENTUM_CHECKS", "1")),
+    "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
+    "price_interval_secs":  5,
+    "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
+}
+
+ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷"}
+
+COINBASE_PRODUCTS = {"BTC": "BTC-USD", "ETH": "ETH-USD"}
+COINGECKO_IDS     = {"BTC": "bitcoin",  "ETH": "ethereum"}
+
+# ─── STATE ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("polysniper-live-v2")
+log = logging.getLogger("polysniper-live")
 
 state = {
-    "balance_usd": 0.0,
-    "connected": False,
-    "client_config": None,
+    "balance_usd":  0.0,
+    "paused":       False,
+    "pause_reason": None,
+    "trades_today": 0,
+    "pnl_today":    0.0,
+    "wins_today":   0,
+    "losses_today": 0,
+    "last_balance_check": 0,
+    "connected":    False,
+    "last_msg_time": time.time(),
 }
 
+windows           = {}
+prices            = {}
+prices_cc         = {}
+prices_cb         = {}
+prices_cg         = {}
+price_histories   = {}
+active_directions = {}
+for a in ASSET_LIST:
+    for tf in TIMEFRAMES:
+        price_histories[(a, tf)] = deque(maxlen=180)
+last_prices_time = 0
+update_offset    = None
+
 clob_client = None
-update_offset = None
+market_cache = {}  # cache of slug → token IDs
 
 
+# ─── TIME HELPERS ────────────────────────────────────────────────────────────
 def est_now():
     return datetime.now(timezone.utc) - timedelta(hours=4)
-
 
 def est_str():
     return est_now().strftime("%H:%M EST")
 
+def est_full():
+    return est_now().strftime("%b %d %H:%M EST")
 
+def fmt_time_short(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - timedelta(hours=4)).strftime("%H:%M")
+    except:
+        return "??:??"
+
+
+# ─── DATABASE ────────────────────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect("trades_live.db")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entered_at TEXT, asset TEXT, timeframe INTEGER, direction TEXT,
+            pct_move REAL, open_price REAL, entry_price REAL,
+            real_entry_cents REAL, shares REAL, cost REAL,
+            order_id TEXT, close_price REAL, result TEXT,
+            payout REAL, profit_loss REAL, balance_after REAL,
+            window_open TEXT, window_close TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def db_insert_trade(t):
+    conn = sqlite3.connect("trades_live.db")
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO trades (entered_at, asset, timeframe, direction, pct_move,
+            open_price, entry_price, real_entry_cents, shares, cost, order_id,
+            window_open, window_close, result)
+        VALUES (:entered_at, :asset, :timeframe, :direction, :pct_move,
+            :open_price, :entry_price, :real_entry_cents, :shares, :cost, :order_id,
+            :window_open, :window_close, 'PENDING')
+    """, t)
+    row_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return row_id
+
+
+def db_settle(row_id, close_price, result, payout, pl, bal):
+    conn = sqlite3.connect("trades_live.db")
+    conn.execute("""
+        UPDATE trades SET close_price=?, result=?, payout=?,
+        profit_loss=?, balance_after=? WHERE id=?
+    """, (close_price, result, payout, pl, bal, row_id))
+    conn.commit()
+    conn.close()
+
+
+def db_stats():
+    conn = sqlite3.connect("trades_live.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT COUNT(*), SUM(CASE WHEN result='WON' THEN 1 ELSE 0 END), SUM(profit_loss)
+        FROM trades WHERE result IN ('WON','LOST')
+    """)
+    r = c.fetchone()
+    conn.close()
+    return r[0] or 0, r[1] or 0, r[2] or 0.0
+
+
+def db_recent_trades(limit=10, offset=0):
+    conn = sqlite3.connect("trades_live.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT entered_at, asset, timeframe, direction, pct_move, result, profit_loss, real_entry_cents
+        FROM trades ORDER BY id DESC LIMIT ? OFFSET ?
+    """, (limit, offset))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# ─── TELEGRAM ────────────────────────────────────────────────────────────────
 def tg(msg):
     try:
+        state["last_msg_time"] = time.time()
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
             timeout=8
         )
-        log.info(f"[TG] {msg[:100]}")
+        log.info(f"[TG] {msg[:80]}")
     except Exception as e:
         log.error(f"TG error: {e}")
 
 
-def try_v2_connection():
-    """Use py-clob-client-v2 with signature_type=3 for deposit wallets."""
-    global clob_client
-    
-    host = "https://clob.polymarket.com"
-    chain_id = 137  # Polygon
-    
-    try:
-        log.info("STEP 1: Creating temporary client for L1 auth...")
-        temp_client = ClobClient(
-            host=host,
-            chain_id=chain_id,
-            key=POLY_PRIVATE_KEY,
-        )
-        
-        log.info("STEP 2: Generating API credentials...")
-        creds = temp_client.create_or_derive_api_key()
-        log.info(f"DEBUG creds type: {type(creds).__name__}")
-        log.info(f"DEBUG creds: {str(creds)[:200]}")
-        
-        log.info("STEP 3: Creating authenticated client with sig_type=3 (POLY_1271)...")
-        clob_client = ClobClient(
-            host=host,
-            chain_id=chain_id,
-            key=POLY_PRIVATE_KEY,
-            creds=creds,
-            signature_type=3,
-            funder=POLY_FUNDER,
-        )
-        
-        log.info("STEP 4: Testing connection - fetching markets...")
-        try:
-            # Try a simple read call first
-            server_time = clob_client.get_server_time()
-            log.info(f"DEBUG server_time: {server_time}")
-        except Exception as e:
-            log.warning(f"get_server_time failed: {e}")
-        
-        log.info("STEP 5: Fetching balance...")
-        try:
-            # v2 might have different balance method
-            if hasattr(clob_client, 'get_balance_allowance'):
-                from py_clob_client_v2 import BalanceAllowanceParams, AssetType
-                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-                bal_resp = clob_client.get_balance_allowance(params)
-                log.info(f"DEBUG bal_resp type: {type(bal_resp).__name__}")
-                log.info(f"DEBUG bal_resp value: {str(bal_resp)[:300]}")
-                
-                if isinstance(bal_resp, dict):
-                    bal_raw = bal_resp.get("balance", 0)
-                else:
-                    bal_raw = getattr(bal_resp, "balance", 0)
-                bal_usd = float(bal_raw) / 1_000_000
-            elif hasattr(clob_client, 'get_balance'):
-                bal_raw = clob_client.get_balance()
-                log.info(f"DEBUG get_balance returned: {bal_raw}")
-                bal_usd = float(bal_raw) / 1_000_000
-            else:
-                # List available methods for debugging
-                methods = [m for m in dir(clob_client) if not m.startswith('_')]
-                log.info(f"DEBUG available methods: {methods[:20]}")
-                bal_usd = 0
-        except Exception as e:
-            log.error(f"Balance fetch error: {e}")
-            bal_usd = 0
-        
-        log.info(f"FINAL Balance: ${bal_usd:.2f}")
-        state["balance_usd"] = bal_usd
-        state["connected"] = True
-        state["client_config"] = "v2 + sig_type=3 + funder"
-        return bal_usd
-        
-    except Exception as e:
-        log.error(f"v2 connection failed: {e}")
-        return None
-
-
-def init_clob():
-    log.info("=" * 50)
-    log.info("INIT CLOB v2 - DIAGNOSTIC INFO")
-    log.info(f"DEBUG poly_key length: {len(POLY_PRIVATE_KEY)}")
-    log.info(f"DEBUG poly_key starts: {POLY_PRIVATE_KEY[:6] if POLY_PRIVATE_KEY else 'EMPTY'}")
-    log.info(f"DEBUG funder: {POLY_FUNDER}")
-    log.info(f"DEBUG v2_available: {V2_AVAILABLE}")
-    log.info("=" * 50)
-    
-    if not V2_AVAILABLE:
-        tg(f"❌ <b>py-clob-client-v2 import failed</b>\n<code>{IMPORT_ERROR}</code>\n\nCheck requirements.txt")
-        return False
-    
-    if not POLY_PRIVATE_KEY:
-        tg("❌ <b>POLY_PRIVATE_KEY missing</b>")
-        return False
-    
-    if not POLY_FUNDER:
-        tg("❌ <b>POLY_FUNDER missing</b>")
-        return False
-    
-    bal = try_v2_connection()
-    
-    if bal is not None and bal > 0:
-        tg(
-            f"✅ <b>Connected to Polymarket (v2)!</b>\n\n"
-            f"💰 Balance: <b>${bal:.2f}</b>\n"
-            f"Config: sig_type=3 (POLY_1271)\n"
-            f"🕐 {est_str()}"
-        )
-        return True
-    elif bal is not None:
-        tg(
-            f"⚠️ <b>Connected but balance is $0</b>\n\n"
-            f"Library v2 worked but balance returns 0.\n"
-            f"Check Railway logs for DEBUG output.\n"
-            f"🕐 {est_str()}"
-        )
-        return False
-    else:
-        tg(
-            f"❌ <b>v2 connection failed</b>\n\n"
-            f"Check Railway logs.\n"
-            f"🕐 {est_str()}"
-        )
-        return False
-
-
-def handle_commands():
+def get_updates():
     global update_offset
     try:
         params = {"timeout": 1, "allowed_updates": ["message"]}
@@ -196,64 +212,617 @@ def handle_commands():
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
             params=params, timeout=5
         )
-        updates = res.json().get("result", [])
+        return res.json().get("result", [])
     except:
-        return
-    
-    for update in updates:
+        return []
+
+
+def handle_commands():
+    global update_offset
+    for update in get_updates():
         update_offset = update["update_id"] + 1
         msg  = update.get("message", {})
         text = msg.get("text", "").strip().lower()
         cid  = str(msg.get("chat", {}).get("id", ""))
         if cid != str(TELEGRAM_CHAT_ID):
             continue
-        
-        if text == "/status":
+
+        if text == "/pause":
+            state["paused"] = True
+            state["pause_reason"] = "Manual"
+            tg("⏸ <b>Paused</b>\n/resume to continue")
+
+        elif text == "/resume":
+            state["paused"] = False
+            state["pause_reason"] = None
+            tg("▶️ <b>Resumed</b>")
+
+        elif text == "/stop":
+            state["paused"] = True
+            state["pause_reason"] = "Emergency stop"
+            tg("🛑 <b>EMERGENCY STOP</b>\n/resume to restart")
+
+        elif text == "/status":
+            total, wins, pnl = db_stats()
+            wr = f"{wins/total*100:.1f}%" if total > 0 else "—"
+            status_e = "⏸" if state["paused"] else "🟢"
+            status_w = "PAUSED" if state["paused"] else "ACTIVE"
             tg(
-                f"🟢 <b>Live Bot v2 Status</b>\n\n"
-                f"Connected: {state['connected']}\n"
-                f"💰 Balance: ${state['balance_usd']:.2f}\n"
-                f"Config: {state['client_config'] or 'Not set'}\n"
+                f"{status_e} <b>{status_w}</b>\n\n"
+                f"💰 Balance: <b>${state['balance_usd']:.2f}</b>\n"
+                f"🎯 Bet: ${CONFIG['bet_size']}\n"
+                f"📊 Today: {state['trades_today']} · ${state['pnl_today']:+.2f}\n"
+                f"🏆 All-time: {total} · {wr} · ${pnl:+.2f}\n"
                 f"🕐 {est_str()}"
             )
-        
+
         elif text == "/balance":
-            if state["connected"]:
-                bal = try_v2_connection()
-                if bal is not None:
-                    tg(f"💰 <b>Balance:</b> ${bal:.2f}\n🕐 {est_str()}")
-                else:
-                    tg("❌ Balance check failed")
+            bal = check_balance(force=True)
+            tg(f"💰 <b>Balance:</b> ${bal:.2f}\n🕐 {est_str()}")
+
+        elif text == "/history" or text.startswith("/history "):
+            page = 1
+            parts = text.split()
+            if len(parts) > 1:
+                try: page = max(1, int(parts[1]))
+                except: page = 1
+            per_page = 10
+            offset = (page - 1) * per_page
+
+            conn = sqlite3.connect("trades_live.db")
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM trades")
+            total = c.fetchone()[0] or 0
+            conn.close()
+
+            trades = db_recent_trades(per_page, offset)
+            max_pages = max(1, (total + per_page - 1) // per_page)
+
+            out = f"📜 <b>History · Page {page}/{max_pages}</b>\n\n"
+            if not trades:
+                out += "(no trades yet)\n"
             else:
-                tg("❌ Not connected to Polymarket")
-        
+                for row in trades:
+                    t, a, tf, d, pct, res, pl, ec = row
+                    emoji = ASSET_EMOJI.get(a, "")
+                    arrow = "🔺" if d == "UP" else "🔻"
+                    res_str = "✅" if res == "WON" else ("❌" if res == "LOST" else "⏳")
+                    pl_str = f"${pl:+.2f}" if pl is not None else "pending"
+                    out += f"  {fmt_time_short(t)} {emoji}{a} {tf}m {arrow} {pct:+.2f}% @{ec or '?'}¢ {res_str} {pl_str}\n"
+            if page < max_pages:
+                out += f"\n➡️ /history {page + 1}"
+            if page > 1:
+                out += f"\n⬅️ /history {page - 1}"
+            tg(out)
+
         elif text == "/help":
             tg(
-                "🤖 <b>Live Bot v2 Commands</b>\n\n"
-                "/status — current status\n"
-                "/balance — refresh balance\n"
-                "/help — this menu"
+                "🤖 <b>LIVE Bot Commands</b>\n\n"
+                "/status — quick status\n"
+                "/balance — refresh real balance\n"
+                "/history — recent trades\n"
+                "/pause — pause trading\n"
+                "/resume — resume\n"
+                "/stop — emergency stop"
             )
 
 
-def main():
+# ─── POLYMARKET CONNECTION ───────────────────────────────────────────────────
+def init_clob():
+    global clob_client
+    if not V2_AVAILABLE:
+        tg(f"❌ <b>py-clob-client-v2 import failed</b>\n<code>{IMPORT_ERROR}</code>")
+        return False
+    if not POLY_PRIVATE_KEY or not POLY_FUNDER:
+        tg("❌ <b>POLY_PRIVATE_KEY or POLY_FUNDER missing</b>")
+        return False
+
+    host = "https://clob.polymarket.com"
+    chain_id = 137
+
+    try:
+        log.info("Creating temporary client for L1 auth...")
+        temp = ClobClient(host=host, chain_id=chain_id, key=POLY_PRIVATE_KEY)
+        creds = temp.create_or_derive_api_key()
+
+        log.info("Creating authenticated client (sig=3, POLY_1271)...")
+        clob_client = ClobClient(
+            host=host,
+            chain_id=chain_id,
+            key=POLY_PRIVATE_KEY,
+            creds=creds,
+            signature_type=3,
+            funder=POLY_FUNDER,
+        )
+        check_balance(force=True)
+        state["connected"] = True
+        log.info(f"Connected. Balance: ${state['balance_usd']:.2f}")
+        return True
+    except Exception as e:
+        log.error(f"CLOB init failed: {e}")
+        tg(f"❌ <b>Polymarket connection failed</b>\n<code>{str(e)[:200]}</code>")
+        return False
+
+
+def check_balance(force=False):
+    global clob_client
+    now = time.time()
+    if not force and now - state["last_balance_check"] < 60:
+        return state["balance_usd"]
+    if not clob_client:
+        return 0.0
+    try:
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        bal_resp = clob_client.get_balance_allowance(params)
+        if isinstance(bal_resp, dict):
+            bal_raw = bal_resp.get("balance", 0)
+        else:
+            bal_raw = getattr(bal_resp, "balance", 0)
+        state["balance_usd"] = float(bal_raw) / 1_000_000
+        state["last_balance_check"] = now
+        return state["balance_usd"]
+    except Exception as e:
+        log.error(f"Balance check failed: {e}")
+        return state["balance_usd"]
+
+
+# ─── PRICE FEEDS ─────────────────────────────────────────────────────────────
+def fetch_cryptocompare():
+    try:
+        symbols = ",".join(ASSET_LIST)
+        url = f"https://min-api.cryptocompare.com/data/pricemulti?fsyms={symbols}&tsyms=USD"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        return {sym: float(data[sym]["USD"]) for sym in ASSET_LIST if sym in data and "USD" in data[sym]}
+    except Exception as e:
+        log.warning(f"CC failed: {e}")
+        return {}
+
+
+def fetch_coinbase():
+    result = {}
+    for asset, product in COINBASE_PRODUCTS.items():
+        try:
+            url = f"https://api.coinbase.com/v2/prices/{product}/spot"
+            res = requests.get(url, timeout=5)
+            data = res.json()
+            if "data" in data and "amount" in data["data"]:
+                result[asset] = float(data["data"]["amount"])
+        except:
+            pass
+    return result
+
+
+def fetch_coingecko():
+    try:
+        ids = ",".join(COINGECKO_IDS.values())
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        result = {}
+        for asset, gid in COINGECKO_IDS.items():
+            if gid in data and "usd" in data[gid]:
+                result[asset] = float(data[gid]["usd"])
+        return result
+    except Exception as e:
+        log.warning(f"CG failed: {e}")
+        return {}
+
+
+def fetch_validated_prices():
+    global prices_cc, prices_cb, prices_cg
+    cc = fetch_cryptocompare()
+    cb = fetch_coinbase()
+    cg = fetch_coingecko()
+    if cc: prices_cc = cc
+    if cb: prices_cb = cb
+    if cg: prices_cg = cg
+
+    validated = {}
+    max_diff_pct = CONFIG["price_agreement_pct"]
+
+    for asset in ASSET_LIST:
+        sources = [p for p in (prices_cc.get(asset), prices_cb.get(asset), prices_cg.get(asset)) if p]
+        if not sources:
+            continue
+        if len(sources) == 1:
+            validated[asset] = sources[0]
+            continue
+        sources.sort()
+        if len(sources) == 2:
+            avg = sum(sources) / 2
+            if abs(sources[0] - sources[1]) / avg * 100 <= max_diff_pct:
+                validated[asset] = avg
+        else:
+            median = sources[1]
+            agreements = 0
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    a = (sources[i] + sources[j]) / 2
+                    if abs(sources[i] - sources[j]) / a * 100 <= max_diff_pct:
+                        agreements += 1
+            if agreements >= 1:
+                validated[asset] = median
+    return validated
+
+
+# ─── WINDOW LOGIC ────────────────────────────────────────────────────────────
+def get_window_times(tf):
+    now = datetime.now(timezone.utc)
+    slot = (now.minute // tf) * tf
+    open_ = now.replace(minute=slot, second=0, microsecond=0)
+    cm = slot + tf
+    if cm >= 60:
+        close_ = open_.replace(hour=(open_.hour + 1) % 24, minute=0)
+    else:
+        close_ = open_.replace(minute=cm)
+    return open_, close_, max(0, int((close_ - now).total_seconds()))
+
+
+def wkey(asset, tf, open_time):
+    return f"{asset}_{tf}_{open_time.strftime('%Y%m%d%H%M')}"
+
+
+def count_reversals(hist):
+    if len(hist) < 3:
+        return 0
+    revs, prev = 0, None
+    pl = list(hist)
+    for i in range(1, len(pl)):
+        d = pl[i] - pl[i-1]
+        if d == 0: continue
+        cur = "up" if d > 0 else "dn"
+        if prev and cur != prev: revs += 1
+        prev = cur
+    return revs
+
+
+def check_momentum(hist, direction, n):
+    if len(hist) < n + 1:
+        return True
+    r = list(hist)[-(n+1):]
+    if direction == "UP":
+        return all(r[i] <= r[i+1] for i in range(len(r)-1))
+    return all(r[i] >= r[i+1] for i in range(len(r)-1))
+
+
+def check_correlation(asset, direction):
+    pairs = [("BTC", "ETH"), ("ETH", "BTC")]
+    for a1, a2 in pairs:
+        if asset == a1:
+            for tf in TIMEFRAMES:
+                if active_directions.get((a2, tf)) == direction:
+                    return False, f"{a2} active {direction}"
+    return True, None
+
+
+# ─── POLYMARKET MARKET LOOKUP ────────────────────────────────────────────────
+def find_market_for_window(asset, tf, open_time):
+    """
+    Find the Polymarket condition_id + token_ids for a given crypto Up/Down market.
+    Polymarket creates markets with slugs like:
+      bitcoin-up-or-down-may-12-5pm-est
+      ethereum-up-or-down-may-12-3-30pm-est
+    """
+    asset_name = {"BTC": "bitcoin", "ETH": "ethereum"}.get(asset)
+    if not asset_name:
+        return None, None, None
+
+    est_time = open_time - timedelta(hours=4)
+    month = est_time.strftime("%B").lower()
+    day = est_time.day
+    hour = est_time.hour
+    minute = est_time.minute
+
+    # Polymarket slug format: "bitcoin-up-or-down-may-12-5pm-est" or "bitcoin-up-or-down-may-12-3-30pm-est"
+    hour_12 = hour % 12 or 12
+    ampm = "am" if hour < 12 else "pm"
+    if minute == 0:
+        time_part = f"{hour_12}{ampm}"
+    else:
+        time_part = f"{hour_12}-{minute:02d}{ampm}"
+    slug = f"{asset_name}-up-or-down-{month}-{day}-{time_part}-est"
+
+    if slug in market_cache:
+        return market_cache[slug]
+
+    try:
+        url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if not data or not isinstance(data, list):
+            log.warning(f"Market not found for slug: {slug}")
+            return None, None, None
+        market = data[0]
+        condition_id = market.get("conditionId")
+        token_ids = market.get("clobTokenIds")
+        if isinstance(token_ids, str):
+            import json
+            token_ids = json.loads(token_ids)
+        # token_ids[0] = YES (UP), token_ids[1] = NO (DOWN)
+        up_token = token_ids[0]
+        down_token = token_ids[1]
+        market_cache[slug] = (condition_id, up_token, down_token)
+        log.info(f"Found market: {slug}")
+        return condition_id, up_token, down_token
+    except Exception as e:
+        log.warning(f"Market lookup error for {slug}: {e}")
+        return None, None, None
+
+
+# ─── ORDER PLACEMENT ─────────────────────────────────────────────────────────
+def place_order(asset, tf, direction, bet_size, open_time):
+    condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
+    if not up_token:
+        return {"status": "failed", "error": "Market not found"}
+
+    token_id = up_token if direction == "UP" else down_token
+
+    try:
+        order_book = clob_client.get_order_book(token_id)
+        if not order_book or not order_book.asks:
+            return {"status": "failed", "error": "Empty order book"}
+
+        best_ask = float(order_book.asks[0].price)
+        shares = round(bet_size / best_ask, 4)
+
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=best_ask,
+            size=shares,
+            side=BUY,
+        )
+        resp = clob_client.create_and_post_order(
+            order_args,
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+            order_type=OrderType.FOK,
+        )
+        log.info(f"Order response: {resp}")
+
+        success = False
+        if isinstance(resp, dict):
+            success = resp.get("success", False) or resp.get("status") == "matched"
+            order_id = resp.get("orderID") or resp.get("orderId", "unknown")
+        else:
+            success = getattr(resp, "success", False)
+            order_id = getattr(resp, "orderID", "unknown")
+
+        return {
+            "status": "filled" if success else "failed",
+            "shares": shares,
+            "entry_cents": best_ask * 100,
+            "order_id": order_id,
+            "raw": str(resp)[:200],
+        }
+    except Exception as e:
+        log.error(f"Order placement error: {e}")
+        return {"status": "failed", "error": str(e)}
+
+
+# ─── TRADING LOOP ────────────────────────────────────────────────────────────
+def process_tick():
+    for tf in TIMEFRAMES:
+        open_time, close_time, secs_left = get_window_times(tf)
+        thresh = ASSET_THRESHOLDS_5 if tf == 5 else ASSET_THRESHOLDS_15
+        max_revs = MAX_REVERSALS_5 if tf == 5 else MAX_REVERSALS_15
+
+        for asset in ASSET_LIST:
+            price = prices.get(asset)
+            if not price:
+                continue
+
+            threshold = thresh[asset]
+            wk_key = wkey(asset, tf, open_time)
+            ws_key = (asset, tf)
+
+            if ws_key not in windows or windows[ws_key]["key"] != wk_key:
+                prev = windows.get(ws_key)
+                if prev and prev["traded"] and prev["trade_db_id"]:
+                    settle(prev, asset, tf, price)
+                if ws_key in active_directions:
+                    del active_directions[ws_key]
+                windows[ws_key] = {
+                    "key": wk_key, "open_time": open_time, "close_time": close_time,
+                    "open_price": price, "traded": False, "skipped": False,
+                    "trade_db_id": None, "direction": None
+                }
+                price_histories[ws_key].clear()
+
+            price_histories[ws_key].append(price)
+            w = windows[ws_key]
+            pct = (price - w["open_price"]) / w["open_price"] * 100
+            absp = abs(pct)
+            dirn = "UP" if pct >= 0 else "DOWN"
+
+            if w["traded"] or w["skipped"]:
+                continue
+            if secs_left <= 0 or secs_left > CONFIG["entry_window_seconds"]:
+                continue
+            if absp < threshold:
+                continue
+            if state["paused"]:
+                continue
+            if state["balance_usd"] < CONFIG["min_balance"]:
+                state["paused"] = True
+                state["pause_reason"] = "Balance too low"
+                tg(f"🛑 <b>Balance ${state['balance_usd']:.2f} < ${CONFIG['min_balance']}</b>\nPaused.")
+                continue
+
+            corr_ok, corr_reason = check_correlation(asset, dirn)
+            if not corr_ok:
+                w["skipped"] = True
+                continue
+
+            hist = price_histories[ws_key]
+            revs = count_reversals(hist)
+            mom = check_momentum(hist, dirn, CONFIG["momentum_checks"])
+
+            if revs > max_revs or not mom:
+                w["skipped"] = True
+                continue
+
+            enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time)
+
+
+def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time):
+    bet = min(CONFIG["bet_size"], state["balance_usd"])
+    if bet < CONFIG["min_balance"]:
+        return
+
+    w["traded"] = True
+    result = place_order(asset, tf, dirn, bet, open_time)
+
+    emoji = ASSET_EMOJI.get(asset, "")
+    arrow = "🔺" if dirn == "UP" else "🔻"
+
+    if result["status"] == "filled":
+        now = datetime.now(timezone.utc)
+        trade = {
+            "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
+            "direction": dirn, "pct_move": round(pct, 4),
+            "open_price": w["open_price"], "entry_price": price,
+            "real_entry_cents": round(result["entry_cents"], 1),
+            "shares": result["shares"], "cost": bet,
+            "order_id": result["order_id"],
+            "window_open": open_time.isoformat(),
+            "window_close": close_time.isoformat(),
+        }
+        db_id = db_insert_trade(trade)
+        w["trade_db_id"] = db_id
+        w["direction"] = dirn
+        state["balance_usd"] -= bet
+        state["trades_today"] += 1
+        active_directions[(asset, tf)] = dirn
+
+        tg(
+            f"{arrow} <b>{emoji} {asset} · {tf}m · {dirn}</b>\n\n"
+            f"📈 Move: {pct:+.3f}%\n"
+            f"⏱ {secs_left}s left · {revs_str(w, asset, tf)} rev\n"
+            f"💵 ${bet} @ <b>{result['entry_cents']:.1f}¢</b>\n"
+            f"📦 {result['shares']} shares\n"
+            f"🆔 <code>{result['order_id'][:12]}...</code>\n"
+            f"🕐 {est_str()}"
+        )
+    else:
+        err = result.get("error", "unknown")
+        log.error(f"Trade failed: {err}")
+        tg(
+            f"❌ <b>Trade failed</b>\n"
+            f"{emoji} {asset} {tf}m {dirn}\n"
+            f"<code>{err[:200]}</code>"
+        )
+
+
+def revs_str(w, asset, tf):
+    ws_key = (asset, tf)
+    return count_reversals(price_histories[ws_key])
+
+
+def settle(w, asset, tf, close_price):
+    close_pct = (close_price - w["open_price"]) / w["open_price"] * 100
+    actual = "UP" if close_pct >= 0 else "DOWN"
+    won = actual == w["direction"]
+
+    conn = sqlite3.connect("trades_live.db")
+    c = conn.cursor()
+    c.execute("SELECT real_entry_cents, cost, shares FROM trades WHERE id=?", (w["trade_db_id"],))
+    row = c.fetchone()
+    conn.close()
+    entry_c, cost, shares = (row or (99.0, CONFIG["bet_size"], 0))
+
+    if won:
+        # Each share pays out $1.00 (100¢)
+        payout = shares * 1.0
+        pl = payout - cost
+    else:
+        payout = 0
+        pl = -cost
+
+    # Refresh real balance from Polymarket
+    check_balance(force=True)
+    state["pnl_today"] += pl
+    if won:
+        state["wins_today"] += 1
+    else:
+        state["losses_today"] += 1
+
+    result = "WON" if won else "LOST"
+    db_settle(w["trade_db_id"], close_price, result, payout, pl, state["balance_usd"])
+
+    total, wins, total_pnl = db_stats()
+    wr = f"{wins/total*100:.1f}%" if total > 0 else "—"
+    emoji = ASSET_EMOJI.get(asset, "")
+    out_emoji = "✅" if won else "❌"
+
     tg(
-        f"🚀 <b>PolySniper LIVE v2.0</b>\n"
-        f"📚 Using py-clob-client-v2\n"
-        f"🔧 Signature type 3 (POLY_1271)\n\n"
-        f"🕐 {est_str()}\n\n"
+        f"{out_emoji} <b>{emoji} {asset} {tf}m · {result}</b>\n\n"
+        f"Called: {w['direction']} · Actual: {actual}\n"
+        f"PnL: <b>${pl:+.2f}</b> · Bal: ${state['balance_usd']:.2f}\n"
+        f"📊 {total} · {wr} · ${total_pnl:+.2f}"
+    )
+
+    if not won:
+        state["paused"] = True
+        state["pause_reason"] = f"Loss on {asset} {tf}m"
+        tg(f"⏸ <b>Auto-paused after loss</b>\n/resume when ready.")
+
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+def main():
+    global prices, last_prices_time
+    init_db()
+
+    tg(
+        f"🚀 <b>PolySniper LIVE v3.0</b>\n"
+        f"🔴 <b>FULL AUTO TRADING</b>\n\n"
+        f"🟠 BTC · 🔷 ETH\n"
+        f"⏱ 5min + 15min\n"
+        f"💵 Bet: ${CONFIG['bet_size']}\n"
+        f"🛑 Auto-stop: 1 loss\n"
+        f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
-    
-    init_clob()
-    
-    log.info("Entering main loop")
+
+    if not init_clob():
+        log.error("Failed to init Polymarket")
+        return
+
+    tg(
+        f"✅ <b>Connected!</b>\n\n"
+        f"💰 Balance: <b>${state['balance_usd']:.2f}</b>\n"
+        f"🎯 Watching BTC + ETH markets\n\n"
+        f"/help for commands"
+    )
+
+    last_price_fetch = 0
     while True:
         try:
+            now = time.time()
+            if now - last_price_fetch >= CONFIG["price_interval_secs"]:
+                new_p = fetch_validated_prices()
+                if new_p:
+                    prices = new_p
+                    last_prices_time = now
+                    if state["pause_reason"] == "Price feed down":
+                        state["paused"] = False
+                        state["pause_reason"] = None
+                        tg("✅ <b>Price feed restored</b>")
+                elif now - last_prices_time > 120 and not state["paused"]:
+                    state["paused"] = True
+                    state["pause_reason"] = "Price feed down"
+                    tg("⚠️ <b>Price feed down 2+ min</b>")
+                last_price_fetch = now
+
             handle_commands()
+            if prices and not state["paused"]:
+                process_tick()
+
+            # Periodic balance refresh
+            if now - state["last_balance_check"] > 300:
+                check_balance()
         except Exception as e:
-            log.error(f"Loop error: {e}")
-        time.sleep(2)
+            log.error(f"Main loop error: {e}")
+        time.sleep(1)
 
 
 if __name__ == "__main__":
