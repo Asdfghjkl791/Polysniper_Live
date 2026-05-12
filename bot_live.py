@@ -560,10 +560,28 @@ def place_order(asset, tf, direction, bet_size, open_time):
 
     try:
         order_book = clob_client.get_order_book(token_id)
-        if not order_book or not order_book.asks:
+        if not order_book:
+            return {"status": "failed", "error": "No order book"}
+
+        # py-clob-client-v2 returns order book as dict OR object - handle both
+        if isinstance(order_book, dict):
+            asks = order_book.get("asks", [])
+        else:
+            asks = getattr(order_book, "asks", [])
+
+        if not asks:
             return {"status": "failed", "error": "Empty order book"}
 
-        best_ask = float(order_book.asks[0].price)
+        # Asks can be list of dicts or objects too
+        first_ask = asks[0]
+        if isinstance(first_ask, dict):
+            best_ask = float(first_ask.get("price", 0))
+        else:
+            best_ask = float(getattr(first_ask, "price", 0))
+
+        if best_ask <= 0:
+            return {"status": "failed", "error": "Invalid ask price"}
+
         entry_cents = best_ask * 100
 
         # Paper bot caps simulated entries at 98¢ - mirror that here
