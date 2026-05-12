@@ -54,6 +54,7 @@ CONFIG = {
     "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
     "price_interval_secs":  5,
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
+    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "98.0")),
 }
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷"}
@@ -500,40 +501,39 @@ def check_correlation(asset, direction):
 def find_market_for_window(asset, tf, open_time):
     """
     Find the Polymarket condition_id + token_ids for a given crypto Up/Down market.
-    Polymarket creates markets with slugs like:
-      bitcoin-up-or-down-may-12-5pm-est
-      ethereum-up-or-down-may-12-3-30pm-est
+    Polymarket uses Unix timestamp-based event slugs:
+      btc-updown-5m-{timestamp}      (5-min event, timestamp = window start Unix epoch)
+      eth-updown-5m-{timestamp}
+      btc-updown-15m-{timestamp}     (15-min event)
+      eth-updown-15m-{timestamp}
+    Note: the slug is an EVENT slug. We query /events?slug=... and pull markets from inside.
     """
-    asset_name = {"BTC": "bitcoin", "ETH": "ethereum"}.get(asset)
-    if not asset_name:
+    asset_short = {"BTC": "btc", "ETH": "eth"}.get(asset)
+    if not asset_short:
         return None, None, None
 
-    est_time = open_time - timedelta(hours=4)
-    month = est_time.strftime("%B").lower()
-    day = est_time.day
-    hour = est_time.hour
-    minute = est_time.minute
-
-    # Polymarket slug format: "bitcoin-up-or-down-may-12-5pm-est" or "bitcoin-up-or-down-may-12-3-30pm-est"
-    hour_12 = hour % 12 or 12
-    ampm = "am" if hour < 12 else "pm"
-    if minute == 0:
-        time_part = f"{hour_12}{ampm}"
-    else:
-        time_part = f"{hour_12}-{minute:02d}{ampm}"
-    slug = f"{asset_name}-up-or-down-{month}-{day}-{time_part}-est"
+    # Convert window open_time to Unix timestamp (seconds since epoch)
+    window_ts = int(open_time.timestamp())
+    slug = f"{asset_short}-updown-{tf}m-{window_ts}"
 
     if slug in market_cache:
         return market_cache[slug]
 
     try:
-        url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+        # Query the EVENTS endpoint (not markets) since the slug is an event slug
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
         res = requests.get(url, timeout=10)
         data = res.json()
-        if not data or not isinstance(data, list):
-            log.warning(f"Market not found for slug: {slug}")
+        if not data or not isinstance(data, list) or len(data) == 0:
+            log.warning(f"Event not found for slug: {slug}")
             return None, None, None
-        market = data[0]
+        event = data[0]
+        markets = event.get("markets", [])
+        if not markets:
+            log.warning(f"No markets in event: {slug}")
+            return None, None, None
+        # Up/Down events typically have ONE market with two outcomes (YES=Up, NO=Down)
+        market = markets[0]
         condition_id = market.get("conditionId")
         token_ids = market.get("clobTokenIds")
         if isinstance(token_ids, str):
@@ -543,7 +543,7 @@ def find_market_for_window(asset, tf, open_time):
         up_token = token_ids[0]
         down_token = token_ids[1]
         market_cache[slug] = (condition_id, up_token, down_token)
-        log.info(f"Found market: {slug}")
+        log.info(f"Found market via event {slug}: condId={condition_id[:10]}...")
         return condition_id, up_token, down_token
     except Exception as e:
         log.warning(f"Market lookup error for {slug}: {e}")
@@ -564,6 +564,16 @@ def place_order(asset, tf, direction, bet_size, open_time):
             return {"status": "failed", "error": "Empty order book"}
 
         best_ask = float(order_book.asks[0].price)
+        entry_cents = best_ask * 100
+
+        # Paper bot caps simulated entries at 98¢ - mirror that here
+        if entry_cents > CONFIG["max_entry_cents"]:
+            return {
+                "status": "skipped",
+                "error": f"Ask {entry_cents:.1f}¢ > max {CONFIG['max_entry_cents']:.0f}¢",
+                "entry_cents": entry_cents,
+            }
+
         shares = round(bet_size / best_ask, 4)
 
         order_args = OrderArgs(
@@ -674,6 +684,18 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
 
     emoji = ASSET_EMOJI.get(asset, "")
     arrow = "🔺" if dirn == "UP" else "🔻"
+
+    if result["status"] == "skipped":
+        # Entry too expensive (>98¢) - don't trade but don't pause either
+        w["skipped"] = True
+        w["traded"] = False
+        log.info(f"Skipped {asset} {tf}m {dirn}: {result['error']}")
+        tg(
+            f"⏭ <b>Skipped {emoji} {asset} {tf}m {dirn}</b>\n"
+            f"{result['error']}\n"
+            f"📈 Move: {pct:+.3f}%"
+        )
+        return
 
     if result["status"] == "filled":
         now = datetime.now(timezone.utc)
