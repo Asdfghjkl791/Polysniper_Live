@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v1.1 - Clean Edition with Diagnostic Logging
-# - Tries multiple wallet configs automatically
-# - Heavy debug logging to diagnose Polymarket account type
+# PolySniper LIVE v2.0 - Using py-clob-client-v2 for new deposit wallets
+# - signature_type=3 (POLY_1271) for email-signup accounts
+# - Diagnostic mode: connects, reads balance, no trading yet
 # - All times in EST
 
 import os
 import time
-import sqlite3
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
 
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.constants import POLYGON
-    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType, OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
-    POLY_AVAILABLE = True
+    from py_clob_client_v2 import ClobClient, OrderArgs, PartialCreateOrderOptions, ApiCreds
+    from py_clob_client_v2.order_builder.constants import BUY
+    V2_AVAILABLE = True
+    IMPORT_ERROR = None
 except ImportError as e:
-    POLY_AVAILABLE = False
+    V2_AVAILABLE = False
     IMPORT_ERROR = str(e)
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -26,29 +24,17 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "").strip()
 POLY_FUNDER      = os.environ.get("POLY_FUNDER", "").strip()
 
-CONFIG = {
-    "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
-    "min_balance":          float(os.environ.get("MIN_BALANCE", "5.0")),
-    "max_losses_streak":    int(os.environ.get("MAX_LOSSES_STREAK", "2")),
-    "max_api_errors":       int(os.environ.get("MAX_API_ERRORS", "3")),
-    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "10")),
-    "max_trades_per_day":   int(os.environ.get("MAX_TRADES_DAY", "20")),
-    "daily_loss_limit":     float(os.environ.get("DAILY_LOSS_LIMIT", "5.0")),
-    "dry_run":              os.environ.get("DRY_RUN", "false").lower() == "true",
-}
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("polysniper-live")
+log = logging.getLogger("polysniper-live-v2")
 
 state = {
-    "balance_usd":           0.0,
-    "paused":                False,
-    "clob_config":           None,
-    "start_time":            datetime.now(timezone.utc),
+    "balance_usd": 0.0,
+    "connected": False,
+    "client_config": None,
 }
 
 clob_client = None
@@ -57,6 +43,7 @@ update_offset = None
 
 def est_now():
     return datetime.now(timezone.utc) - timedelta(hours=4)
+
 
 def est_str():
     return est_now().strftime("%H:%M EST")
@@ -74,119 +61,129 @@ def tg(msg):
         log.error(f"TG error: {e}")
 
 
-def try_config(sig_type, funder, name):
-    """Try one wallet configuration. Returns (balance, response_data) or (None, None) on fail."""
+def try_v2_connection():
+    """Use py-clob-client-v2 with signature_type=3 for deposit wallets."""
     global clob_client
+    
     host = "https://clob.polymarket.com"
+    chain_id = 137  # Polygon
     
     try:
-        log.info(f"Trying: {name}")
+        log.info("STEP 1: Creating temporary client for L1 auth...")
+        temp_client = ClobClient(
+            host=host,
+            chain_id=chain_id,
+            key=POLY_PRIVATE_KEY,
+        )
         
-        if funder:
-            clob_client = ClobClient(
-                host,
-                key=POLY_PRIVATE_KEY,
-                chain_id=POLYGON,
-                signature_type=sig_type,
-                funder=funder,
-            )
-        else:
-            clob_client = ClobClient(host, key=POLY_PRIVATE_KEY, chain_id=POLYGON)
+        log.info("STEP 2: Generating API credentials...")
+        creds = temp_client.create_or_derive_api_key()
+        log.info(f"DEBUG creds type: {type(creds).__name__}")
+        log.info(f"DEBUG creds: {str(creds)[:200]}")
         
-        # Get signer address for debugging
+        log.info("STEP 3: Creating authenticated client with sig_type=3 (POLY_1271)...")
+        clob_client = ClobClient(
+            host=host,
+            chain_id=chain_id,
+            key=POLY_PRIVATE_KEY,
+            creds=creds,
+            signature_type=3,
+            funder=POLY_FUNDER,
+        )
+        
+        log.info("STEP 4: Testing connection - fetching markets...")
         try:
-            addr = clob_client.get_address()
-            log.info(f"DEBUG signer address: {addr}")
+            # Try a simple read call first
+            server_time = clob_client.get_server_time()
+            log.info(f"DEBUG server_time: {server_time}")
         except Exception as e:
-            log.info(f"DEBUG get_address failed: {e}")
+            log.warning(f"get_server_time failed: {e}")
         
-        # Set API credentials
-        clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
+        log.info("STEP 5: Fetching balance...")
+        try:
+            # v2 might have different balance method
+            if hasattr(clob_client, 'get_balance_allowance'):
+                from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                bal_resp = clob_client.get_balance_allowance(params)
+                log.info(f"DEBUG bal_resp type: {type(bal_resp).__name__}")
+                log.info(f"DEBUG bal_resp value: {str(bal_resp)[:300]}")
+                
+                if isinstance(bal_resp, dict):
+                    bal_raw = bal_resp.get("balance", 0)
+                else:
+                    bal_raw = getattr(bal_resp, "balance", 0)
+                bal_usd = float(bal_raw) / 1_000_000
+            elif hasattr(clob_client, 'get_balance'):
+                bal_raw = clob_client.get_balance()
+                log.info(f"DEBUG get_balance returned: {bal_raw}")
+                bal_usd = float(bal_raw) / 1_000_000
+            else:
+                # List available methods for debugging
+                methods = [m for m in dir(clob_client) if not m.startswith('_')]
+                log.info(f"DEBUG available methods: {methods[:20]}")
+                bal_usd = 0
+        except Exception as e:
+            log.error(f"Balance fetch error: {e}")
+            bal_usd = 0
         
-        # Try to fetch balance
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        bal_resp = clob_client.get_balance_allowance(params)
-        
-        log.info(f"DEBUG bal_resp type: {type(bal_resp).__name__}")
-        log.info(f"DEBUG bal_resp value: {str(bal_resp)[:300]}")
-        
-        # Try to extract balance from response
-        bal_raw = 0
-        if isinstance(bal_resp, dict):
-            bal_raw = bal_resp.get("balance", 0)
-        else:
-            bal_raw = getattr(bal_resp, "balance", 0)
-        
-        bal_usd = float(bal_raw) / 1_000_000
-        log.info(f"Result: balance=${bal_usd:.2f}")
-        
-        return bal_usd, bal_resp
+        log.info(f"FINAL Balance: ${bal_usd:.2f}")
+        state["balance_usd"] = bal_usd
+        state["connected"] = True
+        state["client_config"] = "v2 + sig_type=3 + funder"
+        return bal_usd
         
     except Exception as e:
-        log.warning(f"Config {name} threw exception: {e}")
-        return None, None
+        log.error(f"v2 connection failed: {e}")
+        return None
 
 
 def init_clob():
-    """Try multiple wallet configurations until one returns non-zero balance."""
-    
     log.info("=" * 50)
-    log.info("INIT CLOB - DIAGNOSTIC INFO")
+    log.info("INIT CLOB v2 - DIAGNOSTIC INFO")
     log.info(f"DEBUG poly_key length: {len(POLY_PRIVATE_KEY)}")
     log.info(f"DEBUG poly_key starts: {POLY_PRIVATE_KEY[:6] if POLY_PRIVATE_KEY else 'EMPTY'}")
-    log.info(f"DEBUG funder length: {len(POLY_FUNDER)}")
-    log.info(f"DEBUG funder value: {POLY_FUNDER if POLY_FUNDER else 'EMPTY'}")
-    log.info(f"DEBUG dry_run: {CONFIG['dry_run']}")
+    log.info(f"DEBUG funder: {POLY_FUNDER}")
+    log.info(f"DEBUG v2_available: {V2_AVAILABLE}")
     log.info("=" * 50)
     
-    if not POLY_AVAILABLE:
-        tg(f"❌ <b>py-clob-client import failed</b>\n<code>{IMPORT_ERROR}</code>")
+    if not V2_AVAILABLE:
+        tg(f"❌ <b>py-clob-client-v2 import failed</b>\n<code>{IMPORT_ERROR}</code>\n\nCheck requirements.txt")
         return False
     
     if not POLY_PRIVATE_KEY:
         tg("❌ <b>POLY_PRIVATE_KEY missing</b>")
         return False
     
-    # Build configurations to try
-    configs = []
+    if not POLY_FUNDER:
+        tg("❌ <b>POLY_FUNDER missing</b>")
+        return False
     
-    if POLY_FUNDER:
-        configs.append({"sig": 1, "funder": POLY_FUNDER, "name": "Email wallet (sig=1)"})
-        configs.append({"sig": 2, "funder": POLY_FUNDER, "name": "Proxy wallet (sig=2)"})
+    bal = try_v2_connection()
     
-    configs.append({"sig": 0, "funder": None, "name": "Standard EOA (sig=0)"})
-    
-    # Try each config
-    best_balance = 0.0
-    best_config = None
-    
-    for cfg in configs:
-        bal, resp = try_config(cfg["sig"], cfg["funder"], cfg["name"])
-        if bal is not None and bal > best_balance:
-            best_balance = bal
-            best_config = cfg
-    
-    if best_balance > 0:
-        # Reconnect with the working config (since clob_client got overwritten)
-        try_config(best_config["sig"], best_config["funder"], best_config["name"])
-        state["balance_usd"] = best_balance
-        state["clob_config"] = best_config["name"]
+    if bal is not None and bal > 0:
         tg(
-            f"✅ <b>Connected to Polymarket!</b>\n\n"
-            f"Config: {best_config['name']}\n"
-            f"💰 Balance: <b>${best_balance:.2f}</b>\n"
+            f"✅ <b>Connected to Polymarket (v2)!</b>\n\n"
+            f"💰 Balance: <b>${bal:.2f}</b>\n"
+            f"Config: sig_type=3 (POLY_1271)\n"
             f"🕐 {est_str()}"
         )
         return True
-    
-    tg(
-        f"⚠️ <b>Connected but balance is $0</b>\n\n"
-        f"All wallet configs tried but none show your balance.\n"
-        f"Check Railway logs for DEBUG info.\n\n"
-        f"Funder: <code>{POLY_FUNDER[:10]}...</code>\n"
-        f"🕐 {est_str()}"
-    )
-    return False
+    elif bal is not None:
+        tg(
+            f"⚠️ <b>Connected but balance is $0</b>\n\n"
+            f"Library v2 worked but balance returns 0.\n"
+            f"Check Railway logs for DEBUG output.\n"
+            f"🕐 {est_str()}"
+        )
+        return False
+    else:
+        tg(
+            f"❌ <b>v2 connection failed</b>\n\n"
+            f"Check Railway logs.\n"
+            f"🕐 {est_str()}"
+        )
+        return False
 
 
 def handle_commands():
@@ -213,33 +210,27 @@ def handle_commands():
         
         if text == "/status":
             tg(
-                f"🟢 <b>Live Bot Status</b>\n\n"
+                f"🟢 <b>Live Bot v2 Status</b>\n\n"
+                f"Connected: {state['connected']}\n"
                 f"💰 Balance: ${state['balance_usd']:.2f}\n"
-                f"Config: {state['clob_config'] or 'Not connected'}\n"
+                f"Config: {state['client_config'] or 'Not set'}\n"
                 f"🕐 {est_str()}"
             )
         
         elif text == "/balance":
-            if clob_client:
-                try:
-                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-                    bal_resp = clob_client.get_balance_allowance(params)
-                    if isinstance(bal_resp, dict):
-                        bal_raw = bal_resp.get("balance", 0)
-                    else:
-                        bal_raw = getattr(bal_resp, "balance", 0)
-                    bal_usd = float(bal_raw) / 1_000_000
-                    state["balance_usd"] = bal_usd
-                    tg(f"💰 <b>Balance:</b> ${bal_usd:.2f}\n🕐 {est_str()}")
-                except Exception as e:
-                    tg(f"❌ Balance check failed: <code>{str(e)[:200]}</code>")
+            if state["connected"]:
+                bal = try_v2_connection()
+                if bal is not None:
+                    tg(f"💰 <b>Balance:</b> ${bal:.2f}\n🕐 {est_str()}")
+                else:
+                    tg("❌ Balance check failed")
             else:
                 tg("❌ Not connected to Polymarket")
         
         elif text == "/help":
             tg(
-                "🤖 <b>Live Bot Commands</b>\n\n"
-                "/status — quick status\n"
+                "🤖 <b>Live Bot v2 Commands</b>\n\n"
+                "/status — current status\n"
                 "/balance — refresh balance\n"
                 "/help — this menu"
             )
@@ -247,21 +238,16 @@ def handle_commands():
 
 def main():
     tg(
-        f"🚀 <b>PolySniper LIVE v1.1</b>\n"
-        f"⚠️ <b>🔴 DIAGNOSTIC MODE</b>\n\n"
+        f"🚀 <b>PolySniper LIVE v2.0</b>\n"
+        f"📚 Using py-clob-client-v2\n"
+        f"🔧 Signature type 3 (POLY_1271)\n\n"
         f"🕐 {est_str()}\n\n"
-        f"Checking Polymarket connection..."
+        f"Connecting to Polymarket..."
     )
     
-    success = init_clob()
+    init_clob()
     
-    if success:
-        log.info("Bot initialized successfully")
-    else:
-        log.warning("Bot connected but balance shows $0")
-    
-    # Keep the bot running for command handling
-    log.info("Entering main loop (command handler only - no trading yet)")
+    log.info("Entering main loop")
     while True:
         try:
             handle_commands()
