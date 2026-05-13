@@ -56,7 +56,7 @@ CONFIG = {
     "price_interval_secs":  5,
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
     "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "85.0")),
-    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "99.0")),
+    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "99.9")),
 }
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷"}
@@ -157,6 +157,23 @@ def db_insert_trade(t):
     return row_id
 
 
+def db_log_skip(asset, tf, direction, pct_move, open_price, entry_cents, reason, open_time, close_time, secs_left):
+    """Log a skipped signal to the trades DB for history tracking (no money spent)."""
+    conn = sqlite3.connect("trades_live.db")
+    c = conn.cursor()
+    now = datetime.now(timezone.utc).isoformat()
+    c.execute("""
+        INSERT INTO trades (entered_at, asset, timeframe, direction, pct_move,
+            open_price, entry_price, real_entry_cents, shares, cost, order_id,
+            window_open, window_close, result, profit_loss)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'SKIPPED', 0)
+    """, (now, asset, tf, direction, round(pct_move, 4),
+          open_price, open_price, round(entry_cents, 1),
+          reason[:100], open_time.isoformat(), close_time.isoformat()))
+    conn.commit()
+    conn.close()
+
+
 def db_settle(row_id, close_price, result, payout, pl, bal):
     conn = sqlite3.connect("trades_live.db")
     conn.execute("""
@@ -183,7 +200,7 @@ def db_recent_trades(limit=10, offset=0):
     conn = sqlite3.connect("trades_live.db")
     c = conn.cursor()
     c.execute("""
-        SELECT entered_at, asset, timeframe, direction, pct_move, result, profit_loss, real_entry_cents
+        SELECT entered_at, asset, timeframe, direction, pct_move, result, profit_loss, real_entry_cents, window_close
         FROM trades ORDER BY id DESC LIMIT ? OFFSET ?
     """, (limit, offset))
     rows = c.fetchall()
@@ -248,6 +265,12 @@ def handle_commands():
         elif text == "/status":
             total, wins, pnl = db_stats()
             wr = f"{wins/total*100:.1f}%" if total > 0 else "—"
+            # Count skipped signals
+            conn = sqlite3.connect("trades_live.db")
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM trades WHERE result='SKIPPED'")
+            skipped = c.fetchone()[0] or 0
+            conn.close()
             status_e = "⏸" if state["paused"] else "🟢"
             status_w = "PAUSED" if state["paused"] else "ACTIVE"
             tg(
@@ -256,6 +279,7 @@ def handle_commands():
                 f"🎯 Bet: ${CONFIG['bet_size']}\n"
                 f"📊 Today: {state['trades_today']} · ${state['pnl_today']:+.2f}\n"
                 f"🏆 All-time: {total} · {wr} · ${pnl:+.2f}\n"
+                f"⏭ Skipped: {skipped}\n"
                 f"🕐 {est_str()}"
             )
 
@@ -286,12 +310,30 @@ def handle_commands():
                 out += "(no trades yet)\n"
             else:
                 for row in trades:
-                    t, a, tf, d, pct, res, pl, ec = row
+                    t, a, tf, d, pct, res, pl, ec, wc = row
                     emoji = ASSET_EMOJI.get(a, "")
                     arrow = "🔺" if d == "UP" else "🔻"
-                    res_str = "✅" if res == "WON" else ("❌" if res == "LOST" else "⏳")
-                    pl_str = f"${pl:+.2f}" if pl is not None else "pending"
-                    out += f"  {fmt_time_short(t)} {emoji}{a} {tf}m {arrow} {pct:+.2f}% @{ec or '?'}¢ {res_str} {pl_str}\n"
+                    if res == "WON":
+                        res_str = "✅"
+                    elif res == "LOST":
+                        res_str = "❌"
+                    elif res == "SKIPPED":
+                        res_str = "⏭"
+                    else:
+                        res_str = "⏳"
+                    pl_str = f"${pl:+.2f}" if pl is not None and res != "SKIPPED" else ("—" if res == "SKIPPED" else "pending")
+                    # Calculate seconds left when entered
+                    secs_left_str = ""
+                    try:
+                        entered_dt = datetime.fromisoformat(t)
+                        close_dt = datetime.fromisoformat(wc)
+                        if entered_dt.tzinfo is None: entered_dt = entered_dt.replace(tzinfo=timezone.utc)
+                        if close_dt.tzinfo is None: close_dt = close_dt.replace(tzinfo=timezone.utc)
+                        secs_left = max(0, int((close_dt - entered_dt).total_seconds()))
+                        secs_left_str = f" ({secs_left}s)"
+                    except:
+                        pass
+                    out += f"  {fmt_time_short(t)}{secs_left_str} {emoji}{a} {tf}m {arrow} {pct:+.2f}% @{ec or '?'}¢ {res_str} {pl_str}\n"
             if page < max_pages:
                 out += f"\n➡️ /history {page + 1}"
             if page > 1:
@@ -720,13 +762,13 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
     arrow = "🔺" if dirn == "UP" else "🔻"
 
     if result["status"] == "skipped":
-        # Entry too expensive or too cheap - mark skipped (won't retry this window)
+        # Entry too expensive or too cheap - log to DB silently, no Telegram spam
         w["skipped"] = True
         log.info(f"Skipped {asset} {tf}m {dirn}: {result['error']}")
-        tg(
-            f"⏭ <b>Skipped {emoji} {asset} {tf}m {dirn}</b>\n"
-            f"{result['error']}\n"
-            f"📈 Move: {pct:+.3f}% · ⏱ {secs_left}s left"
+        db_log_skip(
+            asset, tf, dirn, pct, w["open_price"],
+            result.get("entry_cents", 0), result["error"],
+            open_time, close_time, secs_left
         )
         return
 
