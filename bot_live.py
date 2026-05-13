@@ -49,7 +49,8 @@ MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "40"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
-    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "20")),
+    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "50")),
+    "retry_interval_secs":  int(os.environ.get("RETRY_INTERVAL", "5")),
     "momentum_checks":      int(os.environ.get("MOMENTUM_CHECKS", "1")),
     "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
     "price_interval_secs":  5,
@@ -661,7 +662,8 @@ def process_tick():
                 windows[ws_key] = {
                     "key": wk_key, "open_time": open_time, "close_time": close_time,
                     "open_price": price, "traded": False, "skipped": False,
-                    "trade_db_id": None, "direction": None
+                    "trade_db_id": None, "direction": None,
+                    "last_retry_at": 0,
                 }
                 price_histories[ws_key].clear()
 
@@ -685,6 +687,12 @@ def process_tick():
                 tg(f"🛑 <b>Balance ${state['balance_usd']:.2f} < ${CONFIG['min_balance']}</b>\nPaused.")
                 continue
 
+            # Rate-limit retry attempts - only try every N seconds
+            now_ts = time.time()
+            if now_ts - w["last_retry_at"] < CONFIG["retry_interval_secs"]:
+                continue
+            w["last_retry_at"] = now_ts
+
             corr_ok, corr_reason = check_correlation(asset, dirn)
             if not corr_ok:
                 w["skipped"] = True
@@ -706,25 +714,24 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
     if bet < CONFIG["min_balance"]:
         return
 
-    w["traded"] = True
     result = place_order(asset, tf, dirn, bet, open_time)
 
     emoji = ASSET_EMOJI.get(asset, "")
     arrow = "🔺" if dirn == "UP" else "🔻"
 
     if result["status"] == "skipped":
-        # Entry too expensive (>98¢) - don't trade but don't pause either
+        # Entry too expensive or too cheap - mark skipped (won't retry this window)
         w["skipped"] = True
-        w["traded"] = False
         log.info(f"Skipped {asset} {tf}m {dirn}: {result['error']}")
         tg(
             f"⏭ <b>Skipped {emoji} {asset} {tf}m {dirn}</b>\n"
             f"{result['error']}\n"
-            f"📈 Move: {pct:+.3f}%"
+            f"📈 Move: {pct:+.3f}% · ⏱ {secs_left}s left"
         )
         return
 
     if result["status"] == "filled":
+        w["traded"] = True
         now = datetime.now(timezone.utc)
         trade = {
             "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
@@ -753,13 +760,20 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
             f"🕐 {est_str()}"
         )
     else:
+        # Failed (empty book, network error, etc) - DON'T mark traded, allow retries
         err = result.get("error", "unknown")
-        log.error(f"Trade failed: {err}")
-        tg(
-            f"❌ <b>Trade failed</b>\n"
-            f"{emoji} {asset} {tf}m {dirn}\n"
-            f"<code>{err[:200]}</code>"
-        )
+        log.warning(f"Trade attempt failed (will retry): {err}")
+        # Detect geoblock - this is fatal, pause bot
+        if "403" in err or "restricted" in err.lower() or "geoblock" in err.lower():
+            w["skipped"] = True
+            state["paused"] = True
+            state["pause_reason"] = "Geoblocked by Polymarket"
+            tg(
+                f"🚫 <b>GEOBLOCKED</b>\n\n"
+                f"Polymarket is blocking the bot's server IP.\n"
+                f"Trading paused. Need VPS in allowed region.\n"
+                f"<code>{err[:200]}</code>"
+            )
 
 
 def revs_str(w, asset, tf):
