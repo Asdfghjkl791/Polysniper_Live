@@ -49,12 +49,13 @@ MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "40"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
-    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "10")),
+    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "20")),
     "momentum_checks":      int(os.environ.get("MOMENTUM_CHECKS", "1")),
     "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
     "price_interval_secs":  5,
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
-    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "98.0")),
+    "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "85.0")),
+    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "99.0")),
 }
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷"}
@@ -584,7 +585,15 @@ def place_order(asset, tf, direction, bet_size, open_time):
 
         entry_cents = best_ask * 100
 
-        # Paper bot caps simulated entries at 98¢ - mirror that here
+        # Skip if Polymarket disagrees with our signal (price too low = market thinks we're wrong)
+        if entry_cents < CONFIG["min_entry_cents"]:
+            return {
+                "status": "skipped",
+                "error": f"Ask {entry_cents:.1f}¢ < min {CONFIG['min_entry_cents']:.0f}¢ (market disagrees)",
+                "entry_cents": entry_cents,
+            }
+
+        # Skip if entry exceeds max (only 99¢+ which is rare)
         if entry_cents > CONFIG["max_entry_cents"]:
             return {
                 "status": "skipped",
