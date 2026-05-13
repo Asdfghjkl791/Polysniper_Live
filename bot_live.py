@@ -366,8 +366,14 @@ def init_clob():
     chain_id = 137
 
     try:
-        log.info("Creating temporary client for L1 auth...")
-        temp = ClobClient(host=host, chain_id=chain_id, key=POLY_PRIVATE_KEY)
+        log.info("Creating temporary client for L1 auth (with sig=3)...")
+        temp = ClobClient(
+            host=host,
+            chain_id=chain_id,
+            key=POLY_PRIVATE_KEY,
+            signature_type=3,
+            funder=POLY_FUNDER,
+        )
         creds = temp.create_or_derive_api_key()
 
         log.info("Creating authenticated client (sig=3, POLY_1271)...")
