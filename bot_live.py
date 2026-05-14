@@ -600,8 +600,15 @@ def find_market_for_window(asset, tf, open_time):
         return None, None, None
 
 
-# ─── ORDER PLACEMENT ─────────────────────────────────────────────────────────
+# ─── ORDER PLACEMENT (SIGNALS-ONLY MODE) ─────────────────────────────────────
+# Polymarket API has a known bug preventing order placement for new accounts
+# (signer/API key mismatch). While Polymarket fixes this (ETA Tuesday May 19),
+# bot runs in signals-only mode: detects signals, alerts via Telegram with
+# market link, you manually trade via Polymarket app.
+SIGNALS_ONLY_MODE = True
+
 def place_order(asset, tf, direction, bet_size, open_time):
+    """In signals-only mode, returns the order book info without placing an order."""
     condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
     if not up_token:
         return {"status": "failed", "error": "Market not found"}
@@ -613,7 +620,6 @@ def place_order(asset, tf, direction, bet_size, open_time):
         if not order_book:
             return {"status": "failed", "error": "No order book"}
 
-        # py-clob-client-v2 returns order book as dict OR object - handle both
         if isinstance(order_book, dict):
             asks = order_book.get("asks", [])
         else:
@@ -622,7 +628,6 @@ def place_order(asset, tf, direction, bet_size, open_time):
         if not asks:
             return {"status": "failed", "error": "Empty order book"}
 
-        # Asks can be list of dicts or objects too
         first_ask = asks[0]
         if isinstance(first_ask, dict):
             best_ask = float(first_ask.get("price", 0))
@@ -634,7 +639,6 @@ def place_order(asset, tf, direction, bet_size, open_time):
 
         entry_cents = best_ask * 100
 
-        # Skip if Polymarket disagrees with our signal (price too low = market thinks we're wrong)
         if entry_cents < CONFIG["min_entry_cents"]:
             return {
                 "status": "skipped",
@@ -642,7 +646,6 @@ def place_order(asset, tf, direction, bet_size, open_time):
                 "entry_cents": entry_cents,
             }
 
-        # Skip if entry exceeds max (only 99¢+ which is rare)
         if entry_cents > CONFIG["max_entry_cents"]:
             return {
                 "status": "skipped",
@@ -652,6 +655,20 @@ def place_order(asset, tf, direction, bet_size, open_time):
 
         shares = round(bet_size / best_ask, 4)
 
+        if SIGNALS_ONLY_MODE:
+            # Build market URL for manual trading
+            asset_short = {"BTC": "btc", "ETH": "eth"}.get(asset, asset.lower())
+            window_ts = int(open_time.timestamp())
+            market_url = f"https://polymarket.com/event/{asset_short}-updown-{tf}m-{window_ts}"
+            return {
+                "status": "signal",
+                "shares": shares,
+                "entry_cents": entry_cents,
+                "market_url": market_url,
+                "order_id": "SIGNAL_ONLY",
+            }
+
+        # === REAL ORDER PLACEMENT (currently disabled while Polymarket fixes bug) ===
         order_args = OrderArgs(
             token_id=token_id,
             price=best_ask,
@@ -766,6 +783,38 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
 
     emoji = ASSET_EMOJI.get(asset, "")
     arrow = "🔺" if dirn == "UP" else "🔻"
+
+    if result["status"] == "signal":
+        # Signals-only mode - alert user with market info for manual trading
+        w["traded"] = True  # Mark as traded so we don't fire again for this window
+        now = datetime.now(timezone.utc)
+        # Save to DB as a "signal" record
+        trade = {
+            "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
+            "direction": dirn, "pct_move": round(pct, 4),
+            "open_price": w["open_price"], "entry_price": price,
+            "real_entry_cents": round(result["entry_cents"], 1),
+            "shares": result["shares"], "cost": 0,  # no cost - signal only
+            "order_id": "SIGNAL_ONLY",
+            "window_open": open_time.isoformat(),
+            "window_close": close_time.isoformat(),
+        }
+        db_id = db_insert_trade(trade)
+        w["trade_db_id"] = db_id
+        w["direction"] = dirn
+        active_directions[(asset, tf)] = dirn
+
+        tg(
+            f"🚨 <b>SIGNAL · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+            f"📈 Move: {pct:+.3f}%\n"
+            f"⏱ {secs_left}s left\n"
+            f"💰 Polymarket ask: <b>{result['entry_cents']:.1f}¢</b>\n"
+            f"📦 Would buy: {result['shares']} shares\n"
+            f"💵 Cost: ${bet:.2f}\n\n"
+            f"<a href=\"{result['market_url']}\">🔗 Trade on Polymarket</a>\n"
+            f"🕐 {est_str()}"
+        )
+        return
 
     if result["status"] == "skipped":
         # Entry too expensive or too cheap - log to DB silently, no Telegram spam
@@ -884,12 +933,14 @@ def main():
     init_db()
 
     tg(
-        f"🚀 <b>PolySniper LIVE v3.0</b>\n"
-        f"🔴 <b>FULL AUTO TRADING</b>\n\n"
+        f"🚀 <b>PolySniper LIVE v3.1</b>\n"
+        f"🚨 <b>SIGNALS-ONLY MODE</b>\n\n"
         f"🟠 BTC · 🔷 ETH\n"
         f"⏱ 5min + 15min\n"
-        f"💵 Bet: ${CONFIG['bet_size']}\n"
-        f"🛑 Auto-stop: 1 loss\n"
+        f"💵 Bet size: ${CONFIG['bet_size']}\n"
+        f"📲 Alerts via Telegram\n"
+        f"👆 You trade manually\n\n"
+        f"<i>Auto-trading paused until Polymarket fixes API bug (ETA Tuesday)</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
@@ -901,7 +952,10 @@ def main():
     tg(
         f"✅ <b>Connected!</b>\n\n"
         f"💰 Balance: <b>${state['balance_usd']:.2f}</b>\n"
-        f"🎯 Watching BTC + ETH markets\n\n"
+        f"🎯 Watching BTC + ETH markets\n"
+        f"🚨 Signals-only mode\n\n"
+        f"You'll get a Telegram alert with market link when a signal fires.\n"
+        f"Click the link to trade manually.\n\n"
         f"/help for commands"
     )
 
