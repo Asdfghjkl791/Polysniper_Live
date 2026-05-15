@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v3.0 - Full Auto Trading
-# - BTC + ETH only, 5min + 15min timeframes
-# - $1 bet size, auto-stops after 1 loss
-# - Mirrors paper bot strategy (v4.1 settings)
-# - Uses py-clob-client-v2 with signature_type=3 (POLY_1271 deposit wallet)
+# PolySniper LIVE v3.1 - SIGNALS-ONLY MODE
+# Bot detects signals and sends Telegram alerts with market links.
+# User trades manually via Polymarket app.
+# Auto-trading temporarily disabled while Polymarket fixes their API bug
+# (signer/API key mismatch on deposit wallet accounts).
+# To re-enable auto-trading after Polymarket fix: set SIGNALS_ONLY_MODE = False
 
 import os
 import time
@@ -878,9 +879,87 @@ def revs_str(w, asset, tf):
     return count_reversals(price_histories[ws_key])
 
 
+def fetch_polymarket_outcome(asset, tf, open_time, retry_count=0):
+    """
+    Fetch the ACTUAL settled outcome from Polymarket (Chainlink-based) rather than
+    calculating it from our price sources (CryptoCompare/Coinbase/CoinGecko).
+
+    Returns:
+        "UP" if Polymarket settled the market as UP/YES
+        "DOWN" if Polymarket settled as DOWN/NO
+        None if not yet settled or error
+    """
+    asset_short = {"BTC": "btc", "ETH": "eth"}.get(asset)
+    if not asset_short:
+        return None
+
+    window_ts = int(open_time.timestamp())
+    slug = f"{asset_short}-updown-{tf}m-{window_ts}"
+
+    try:
+        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if not data or not isinstance(data, list) or len(data) == 0:
+            log.warning(f"Outcome fetch: event not found for {slug}")
+            return None
+        event = data[0]
+        markets = event.get("markets", [])
+        if not markets:
+            log.warning(f"Outcome fetch: no markets in event {slug}")
+            return None
+        market = markets[0]
+
+        # Polymarket markets have a "outcomePrices" field that resolves to ["1","0"] or ["0","1"]
+        # after settlement. Index 0 = UP (YES), Index 1 = DOWN (NO).
+        outcome_prices = market.get("outcomePrices")
+        if isinstance(outcome_prices, str):
+            import json
+            try:
+                outcome_prices = json.loads(outcome_prices)
+            except:
+                pass
+
+        # Check if market is closed/resolved
+        closed = market.get("closed", False)
+        resolved = market.get("umaResolutionStatus") == "resolved" or closed
+
+        if not resolved or not outcome_prices or len(outcome_prices) < 2:
+            log.info(f"Outcome fetch: {slug} not yet settled (resolved={resolved})")
+            return None
+
+        up_price = float(outcome_prices[0])
+        down_price = float(outcome_prices[1])
+
+        if up_price >= 0.99:
+            return "UP"
+        elif down_price >= 0.99:
+            return "DOWN"
+        else:
+            log.warning(f"Outcome fetch: ambiguous prices for {slug}: UP={up_price}, DOWN={down_price}")
+            return None
+    except Exception as e:
+        log.warning(f"Outcome fetch error for {slug}: {e}")
+        return None
+
+
 def settle(w, asset, tf, close_price):
-    close_pct = (close_price - w["open_price"]) / w["open_price"] * 100
-    actual = "UP" if close_pct >= 0 else "DOWN"
+    """
+    Settle a trade using Polymarket's actual settled outcome.
+    Falls back to our price calculation only if Polymarket's outcome isn't available.
+    """
+    # First try to get the REAL outcome from Polymarket
+    poly_outcome = fetch_polymarket_outcome(asset, tf, w["open_time"])
+
+    if poly_outcome:
+        actual = poly_outcome
+        source = "Polymarket"
+    else:
+        # Fallback: calculate from our prices (less accurate)
+        close_pct = (close_price - w["open_price"]) / w["open_price"] * 100
+        actual = "UP" if close_pct >= 0 else "DOWN"
+        source = "our prices (Polymarket outcome unavailable)"
+
     won = actual == w["direction"]
 
     conn = sqlite3.connect("trades_live.db")
@@ -917,6 +996,7 @@ def settle(w, asset, tf, close_price):
     tg(
         f"{out_emoji} <b>{emoji} {asset} {tf}m · {result}</b>\n\n"
         f"Called: {w['direction']} · Actual: {actual}\n"
+        f"<i>Source: {source}</i>\n"
         f"PnL: <b>${pl:+.2f}</b> · Bal: ${state['balance_usd']:.2f}\n"
         f"📊 {total} · {wr} · ${total_pnl:+.2f}"
     )
