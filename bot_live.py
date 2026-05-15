@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v3.1 - SIGNALS-ONLY MODE
-# Bot detects signals and sends Telegram alerts with market links.
-# User trades manually via Polymarket app.
-# Auto-trading temporarily disabled while Polymarket fixes their API bug
-# (signer/API key mismatch on deposit wallet accounts).
+# PolySniper LIVE v3.2 - SIGNALS-ONLY MODE + CHAINLINK WS
+# Bot detects signals using Polymarket's Chainlink WebSocket feed (same as settlement).
+# Sends Telegram alerts with market links. User trades manually via Polymarket app.
+# Auto-trading temporarily disabled while Polymarket fixes their API bug.
 # To re-enable auto-trading after Polymarket fix: set SIGNALS_ONLY_MODE = False
 
 import os
@@ -11,8 +10,16 @@ import time
 import sqlite3
 import logging
 import requests
+import json
+import threading
 from datetime import datetime, timezone, timedelta
 from collections import deque
+
+try:
+    import websocket  # websocket-client library
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
 
 try:
     from py_clob_client_v2 import (
@@ -91,6 +98,7 @@ prices            = {}
 prices_cc         = {}
 prices_cb         = {}
 prices_cg         = {}
+prices_chainlink  = {}  # From Polymarket's RTDS WebSocket - same source as their settlement
 price_histories   = {}
 active_directions = {}
 for a in ASSET_LIST:
@@ -461,7 +469,119 @@ def fetch_coingecko():
         return {}
 
 
+# ─── CHAINLINK WEBSOCKET (Polymarket's actual settlement source) ─────────────
+CHAINLINK_WS_URL = "wss://ws-live-data.polymarket.com"
+CHAINLINK_SYMBOLS = {"BTC": "btc/usd", "ETH": "eth/usd"}
+chainlink_last_update = {}  # Track when we last got a price for each asset
+
+
+def chainlink_websocket_worker(asset):
+    """
+    Background thread that maintains a WebSocket connection to Polymarket's Chainlink
+    price feed for ONE asset. Polymarket's WS only supports one symbol per connection,
+    so we run a separate thread for each asset (BTC, ETH).
+
+    Updates prices_chainlink[asset] continuously with the latest Chainlink price.
+    Auto-reconnects on disconnect.
+    """
+    symbol = CHAINLINK_SYMBOLS.get(asset)
+    if not symbol:
+        return
+
+    while True:
+        try:
+            log.info(f"[Chainlink WS] Connecting for {asset} ({symbol})...")
+            ws = websocket.create_connection(CHAINLINK_WS_URL, timeout=10)
+
+            # Subscribe to Chainlink crypto prices for this symbol
+            subscribe_msg = {
+                "action": "subscribe",
+                "subscriptions": [
+                    {
+                        "topic": "crypto_prices_chainlink",
+                        "type": "*",
+                        "filters": json.dumps({"symbol": symbol})
+                    }
+                ]
+            }
+            ws.send(json.dumps(subscribe_msg))
+            log.info(f"[Chainlink WS] Subscribed to {symbol}")
+
+            last_ping = time.time()
+            ws.settimeout(10)
+
+            while True:
+                # Send ping every 5 seconds to keep connection alive
+                now = time.time()
+                if now - last_ping >= 5:
+                    try:
+                        ws.send(json.dumps({"action": "ping"}))
+                        last_ping = now
+                    except:
+                        break
+
+                try:
+                    msg = ws.recv()
+                    if not msg:
+                        continue
+
+                    data = json.loads(msg)
+                    if data.get("topic") == "crypto_prices_chainlink" and data.get("type") == "update":
+                        payload = data.get("payload", {})
+                        if payload.get("symbol") == symbol:
+                            value = float(payload.get("value", 0))
+                            if value > 0:
+                                prices_chainlink[asset] = value
+                                chainlink_last_update[asset] = time.time()
+                except websocket.WebSocketTimeoutException:
+                    continue  # Timeout is okay, keep listening
+                except Exception as e:
+                    log.warning(f"[Chainlink WS] {asset} message error: {e}")
+                    break
+
+        except Exception as e:
+            log.error(f"[Chainlink WS] {asset} connection error: {e}")
+
+        # Reconnect after 5 seconds
+        try:
+            ws.close()
+        except:
+            pass
+        log.info(f"[Chainlink WS] {asset} reconnecting in 5s...")
+        time.sleep(5)
+
+
+def start_chainlink_threads():
+    """Start a background thread for each asset to maintain Chainlink WS connection."""
+    if not WEBSOCKET_AVAILABLE:
+        log.warning("websocket-client not installed - Chainlink feed disabled")
+        return False
+    for asset in ASSET_LIST:
+        t = threading.Thread(target=chainlink_websocket_worker, args=(asset,), daemon=True)
+        t.start()
+    log.info(f"[Chainlink WS] Started {len(ASSET_LIST)} background threads")
+    return True
+
+
+def get_chainlink_price(asset):
+    """
+    Get the latest Chainlink price for an asset.
+    Returns None if no recent update (data older than 30 seconds is stale).
+    """
+    if asset not in prices_chainlink:
+        return None
+    last_update = chainlink_last_update.get(asset, 0)
+    if time.time() - last_update > 30:
+        return None  # Stale data, don't use
+    return prices_chainlink[asset]
+
+
 def fetch_validated_prices():
+    """
+    Returns dict of validated prices. Priority:
+    1. If Chainlink price is fresh (< 30s old), use it directly (matches Polymarket settlement)
+    2. Otherwise fall back to median of CryptoCompare/Coinbase/CoinGecko
+    """
     global prices_cc, prices_cb, prices_cg
     cc = fetch_cryptocompare()
     cb = fetch_coinbase()
@@ -474,6 +594,13 @@ def fetch_validated_prices():
     max_diff_pct = CONFIG["price_agreement_pct"]
 
     for asset in ASSET_LIST:
+        # FIRST: Try Chainlink (Polymarket's actual settlement source)
+        chainlink_price = get_chainlink_price(asset)
+        if chainlink_price:
+            validated[asset] = chainlink_price
+            continue
+
+        # FALLBACK: Use median of CC/CB/CG
         sources = [p for p in (prices_cc.get(asset), prices_cb.get(asset), prices_cg.get(asset)) if p]
         if not sources:
             continue
@@ -790,12 +917,14 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
         w["traded"] = True  # Mark as traded so we don't fire again for this window
         now = datetime.now(timezone.utc)
         # Save to DB as a "signal" record
+        # In signals-only mode, "cost" is the hypothetical cost (what we WOULD have spent)
+        # so PnL math correctly reflects what a real trade would have earned/lost.
         trade = {
             "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
             "direction": dirn, "pct_move": round(pct, 4),
             "open_price": w["open_price"], "entry_price": price,
             "real_entry_cents": round(result["entry_cents"], 1),
-            "shares": result["shares"], "cost": 0,  # no cost - signal only
+            "shares": result["shares"], "cost": bet,  # hypothetical cost for PnL accuracy
             "order_id": "SIGNAL_ONLY",
             "window_open": open_time.isoformat(),
             "window_close": close_time.isoformat(),
@@ -997,7 +1126,7 @@ def settle(w, asset, tf, close_price):
         f"{out_emoji} <b>{emoji} {asset} {tf}m · {result}</b>\n\n"
         f"Called: {w['direction']} · Actual: {actual}\n"
         f"<i>Source: {source}</i>\n"
-        f"PnL: <b>${pl:+.2f}</b> · Bal: ${state['balance_usd']:.2f}\n"
+        f"PnL: <b>${pl:+.3f}</b> · Bal: ${state['balance_usd']:.2f}\n"
         f"📊 {total} · {wr} · ${total_pnl:+.2f}"
     )
 
@@ -1012,14 +1141,18 @@ def main():
     global prices, last_prices_time
     init_db()
 
+    # Start Chainlink WebSocket background threads for accurate settlement-matching prices
+    chainlink_ok = start_chainlink_threads()
+
     tg(
-        f"🚀 <b>PolySniper LIVE v3.1</b>\n"
+        f"🚀 <b>PolySniper LIVE v3.2</b>\n"
         f"🚨 <b>SIGNALS-ONLY MODE</b>\n\n"
         f"🟠 BTC · 🔷 ETH\n"
         f"⏱ 5min + 15min\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
         f"📲 Alerts via Telegram\n"
-        f"👆 You trade manually\n\n"
+        f"👆 You trade manually\n"
+        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ Disabled'}\n\n"
         f"<i>Auto-trading paused until Polymarket fixes API bug (ETA Tuesday)</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
