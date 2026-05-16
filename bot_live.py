@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v3.2 - SIGNALS-ONLY MODE + CHAINLINK WS
-# Bot detects signals using Polymarket's Chainlink WebSocket feed (same as settlement).
+# PolySniper LIVE v3.3 - SIGNALS-ONLY + CHAINLINK WS + CHOPPY FILTER
+# Bot detects signals using Polymarket's Chainlink WebSocket feed.
+# NEW: Skips signals when 6+ reversals in last 30s (too choppy = high reversal risk).
 # Sends Telegram alerts with market links. User trades manually via Polymarket app.
 # Auto-trading temporarily disabled while Polymarket fixes their API bug.
 # To re-enable auto-trading after Polymarket fix: set SIGNALS_ONLY_MODE = False
@@ -65,6 +66,7 @@ CONFIG = {
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
     "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "85.0")),
     "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "99.9")),
+    "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "6")),
 }
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷"}
@@ -656,6 +658,23 @@ def count_reversals(hist):
     return revs
 
 
+def count_reversals_recent(hist, seconds=30):
+    """Count reversals in the last N seconds (price history is appended ~1/sec)."""
+    if len(hist) < 3:
+        return 0
+    recent = list(hist)[-seconds:]
+    if len(recent) < 3:
+        return 0
+    revs, prev = 0, None
+    for i in range(1, len(recent)):
+        d = recent[i] - recent[i-1]
+        if d == 0: continue
+        cur = "up" if d > 0 else "dn"
+        if prev and cur != prev: revs += 1
+        prev = cur
+    return revs
+
+
 def check_momentum(hist, direction, n):
     if len(hist) < n + 1:
         return True
@@ -899,6 +918,13 @@ def process_tick():
                 w["skipped"] = True
                 continue
 
+            # Choppy filter: skip if too many reversals in last 30 seconds
+            recent_revs = count_reversals_recent(hist, seconds=30)
+            if recent_revs >= CONFIG["choppy_threshold"]:
+                w["skipped"] = True
+                log.info(f"Skipped {asset} {tf}m {dirn} - too choppy ({recent_revs} reversals in 30s)")
+                continue
+
             enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time)
 
 
@@ -1074,26 +1100,51 @@ def fetch_polymarket_outcome(asset, tf, open_time, retry_count=0):
 
 def settle(w, asset, tf, close_price):
     """
-    Settle a trade using Polymarket's actual settled outcome.
-    Falls back to our price calculation only if Polymarket's outcome isn't available.
+    Schedules settlement in a background thread so the main loop isn't blocked.
+    The settlement retries fetching Polymarket's outcome for up to 60 seconds.
     """
-    # First try to get the REAL outcome from Polymarket
-    poly_outcome = fetch_polymarket_outcome(asset, tf, w["open_time"])
+    # Capture state we need (in case window state changes during settlement)
+    settle_data = {
+        "trade_db_id": w["trade_db_id"],
+        "direction": w["direction"],
+        "open_time": w["open_time"],
+        "open_price": w["open_price"],
+        "close_price": close_price,
+    }
+    t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
+    t.start()
+
+
+def _settle_worker(d, asset, tf):
+    """Background worker that does the actual settlement with retries."""
+    # Retry fetching Polymarket outcome for up to 60 seconds
+    poly_outcome = None
+    max_retries = 12  # 12 attempts × 5 sec = 60 seconds max wait
+    retry_delay = 5
+
+    for attempt in range(max_retries):
+        poly_outcome = fetch_polymarket_outcome(asset, tf, d["open_time"])
+        if poly_outcome:
+            break
+        if attempt < max_retries - 1:
+            log.info(f"Outcome not ready for {asset} {tf}m, retrying in {retry_delay}s (attempt {attempt+1}/{max_retries})...")
+            time.sleep(retry_delay)
 
     if poly_outcome:
         actual = poly_outcome
         source = "Polymarket"
     else:
         # Fallback: calculate from our prices (less accurate)
-        close_pct = (close_price - w["open_price"]) / w["open_price"] * 100
+        close_pct = (d["close_price"] - d["open_price"]) / d["open_price"] * 100
         actual = "UP" if close_pct >= 0 else "DOWN"
-        source = "our prices (Polymarket outcome unavailable)"
+        source = "our prices (Polymarket outcome unavailable after 60s)"
+        log.warning(f"Settled {asset} {tf}m using our prices fallback - Polymarket outcome never published")
 
-    won = actual == w["direction"]
+    won = actual == d["direction"]
 
     conn = sqlite3.connect("trades_live.db")
     c = conn.cursor()
-    c.execute("SELECT real_entry_cents, cost, shares FROM trades WHERE id=?", (w["trade_db_id"],))
+    c.execute("SELECT real_entry_cents, cost, shares FROM trades WHERE id=?", (d["trade_db_id"],))
     row = c.fetchone()
     conn.close()
     entry_c, cost, shares = (row or (99.0, CONFIG["bet_size"], 0))
@@ -1115,7 +1166,7 @@ def settle(w, asset, tf, close_price):
         state["losses_today"] += 1
 
     result = "WON" if won else "LOST"
-    db_settle(w["trade_db_id"], close_price, result, payout, pl, state["balance_usd"])
+    db_settle(d["trade_db_id"], d["close_price"], result, payout, pl, state["balance_usd"])
 
     total, wins, total_pnl = db_stats()
     wr = f"{wins/total*100:.1f}%" if total > 0 else "—"
@@ -1124,7 +1175,7 @@ def settle(w, asset, tf, close_price):
 
     tg(
         f"{out_emoji} <b>{emoji} {asset} {tf}m · {result}</b>\n\n"
-        f"Called: {w['direction']} · Actual: {actual}\n"
+        f"Called: {d['direction']} · Actual: {actual}\n"
         f"<i>Source: {source}</i>\n"
         f"PnL: <b>${pl:+.3f}</b> · Bal: ${state['balance_usd']:.2f}\n"
         f"📊 {total} · {wr} · ${total_pnl:+.2f}"
@@ -1145,14 +1196,15 @@ def main():
     chainlink_ok = start_chainlink_threads()
 
     tg(
-        f"🚀 <b>PolySniper LIVE v3.2</b>\n"
+        f"🚀 <b>PolySniper LIVE v3.3</b>\n"
         f"🚨 <b>SIGNALS-ONLY MODE</b>\n\n"
         f"🟠 BTC · 🔷 ETH\n"
         f"⏱ 5min + 15min\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
         f"📲 Alerts via Telegram\n"
         f"👆 You trade manually\n"
-        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ Disabled'}\n\n"
+        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ Disabled'}\n"
+        f"🌪 Choppy filter: skip if {CONFIG['choppy_threshold']}+ reversals in 30s\n\n"
         f"<i>Auto-trading paused until Polymarket fixes API bug (ETA Tuesday)</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
