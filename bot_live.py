@@ -1223,17 +1223,18 @@ def main():
     chainlink_ok = start_chainlink_threads()
 
     tg(
-        f"🚀 <b>PolySniper LIVE v3.4</b>\n"
-        f"📊 <b>DATA COLLECTION MODE</b>\n\n"
+        f"🚀 <b>PolySniper LIVE v3.5</b>\n"
+        f"🔗 <b>CHAINLINK-ONLY MODE</b>\n\n"
         f"🟠 BTC · 🔷 ETH\n"
         f"⏱ 5min + 15min\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
         f"📲 Alerts: signals + skips\n"
         f"👆 You trade manually\n"
-        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ Disabled'}\n"
-        f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals (relaxed)\n"
+        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED - bot will not trade'}\n"
+        f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n"
         f"🛑 Auto-pause on loss: <b>DISABLED</b>\n\n"
-        f"<i>Collecting data to tune filters. No real trades.</i>\n\n"
+        f"<i>Only uses Chainlink data — same source Polymarket uses.</i>\n"
+        f"<i>No fallback to CC/CB/CG to prevent settlement disagreements.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
@@ -1253,6 +1254,10 @@ def main():
     )
 
     last_price_fetch = 0
+    startup_time = time.time()
+    last_prices_time = startup_time  # Initialize to startup time, not 0, so we don't fire false warnings
+    grace_period = 60  # Don't fire "feed down" warnings for first 60s after startup
+
     while True:
         try:
             now = time.time()
@@ -1265,7 +1270,7 @@ def main():
                         state["paused"] = False
                         state["pause_reason"] = None
                         tg("✅ <b>Price feed restored</b>")
-                elif now - last_prices_time > 120 and not state["paused"]:
+                elif now - last_prices_time > 120 and now - startup_time > grace_period and not state["paused"]:
                     state["paused"] = True
                     state["pause_reason"] = "Price feed down"
                     tg("⚠️ <b>Price feed down 2+ min</b>")
