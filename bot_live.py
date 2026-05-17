@@ -481,20 +481,21 @@ chainlink_last_update = {}  # Track when we last got a price for each asset
 
 def chainlink_websocket_worker(asset):
     """
-    Background thread that maintains a WebSocket connection to Polymarket's Chainlink
-    price feed. Polymarket sends snapshot + continuous live updates after subscribe.
+    Polymarket sends a snapshot of last 2 minutes of prices on subscribe, then
+    no further updates. So we reconnect every 20 seconds to get a fresh snapshot.
+    The latest price in each snapshot becomes our current price.
     """
     symbol = CHAINLINK_SYMBOLS.get(asset)
     if not symbol:
         return
 
-    msg_count = 0
     while True:
+        ws = None
         try:
             log.info(f"[Chainlink WS] Connecting for {asset} ({symbol})...")
             ws = websocket.create_connection(CHAINLINK_WS_URL, timeout=10)
+            ws.settimeout(5)
 
-            # Subscribe with filters as JSON-encoded string (must start with { or [)
             subscribe_msg = {
                 "action": "subscribe",
                 "subscriptions": [
@@ -506,41 +507,18 @@ def chainlink_websocket_worker(asset):
                 ]
             }
             ws.send(json.dumps(subscribe_msg))
-            log.info(f"[Chainlink WS] {asset} subscribe sent: {json.dumps(subscribe_msg)}")
 
-            last_ping = time.time()
-            last_log = time.time()
-            ws.settimeout(2)  # Shorter timeout so we can ping more often
-
-            while True:
-                now = time.time()
-                if now - last_ping >= 5:
-                    try:
-                        ws.send(json.dumps({"action": "ping"}))
-                        last_ping = now
-                    except Exception as e:
-                        log.warning(f"[Chainlink WS] {asset} ping failed: {e}")
-                        break
-
-                if now - last_log >= 30:
-                    log.info(f"[Chainlink WS] {asset} got {msg_count} msgs in 30s. Price: {prices_chainlink.get(asset, 'NONE')}")
-                    msg_count = 0
-                    last_log = now
-
+            # Receive the snapshot (should arrive within 1-2 seconds)
+            connect_time = time.time()
+            got_data = False
+            while time.time() - connect_time < 5:  # Wait up to 5s for snapshot
                 try:
                     msg = ws.recv()
                     if not msg:
                         continue
-                    msg_count += 1
                     data = json.loads(msg)
-
-                    if msg_count <= 3:
-                        log.info(f"[Chainlink WS] {asset} msg #{msg_count}: {str(data)[:400]}")
-
-                    # Handle both formats:
-                    # Snapshot:  payload.data = [{timestamp, value}, ...]
-                    # Update:    payload = {symbol, timestamp, value}
                     payload = data.get("payload", {})
+
                     if isinstance(payload, dict):
                         data_arr = payload.get("data")
                         if isinstance(data_arr, list) and data_arr:
@@ -550,25 +528,36 @@ def chainlink_websocket_worker(asset):
                                 if value > 0:
                                     prices_chainlink[asset] = value
                                     chainlink_last_update[asset] = time.time()
+                                    got_data = True
+                                    break  # Got fresh price, move on
                         elif "value" in payload:
                             value = float(payload.get("value", 0))
                             if value > 0:
                                 prices_chainlink[asset] = value
                                 chainlink_last_update[asset] = time.time()
+                                got_data = True
+                                break
                 except websocket.WebSocketTimeoutException:
                     continue
                 except Exception as e:
                     log.warning(f"[Chainlink WS] {asset} recv error: {e}")
                     break
 
+            if got_data:
+                log.info(f"[Chainlink WS] {asset} fresh price: {prices_chainlink.get(asset)}")
+            else:
+                log.warning(f"[Chainlink WS] {asset} no data in snapshot")
+
         except Exception as e:
             log.error(f"[Chainlink WS] {asset} connection error: {e}")
+        finally:
+            try:
+                if ws:
+                    ws.close()
+            except:
+                pass
 
-        try:
-            ws.close()
-        except:
-            pass
-        log.info(f"[Chainlink WS] {asset} reconnecting in 5s...")
+        # Wait 5 seconds before reconnecting for fresh snapshot
         time.sleep(5)
 
 
