@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v3.3 - SIGNALS-ONLY + CHAINLINK WS + CHOPPY FILTER
+# PolySniper LIVE v3.4 - SIGNALS-ONLY + CHAINLINK WS + CHOPPY FILTER + SKIP ALERTS
 # Bot detects signals using Polymarket's Chainlink WebSocket feed.
-# NEW: Skips signals when 6+ reversals in last 30s (too choppy = high reversal risk).
+# NEW v3.4: Telegram alerts for skipped trades + reversal counts logged for all signals.
+# This helps tune the CHOPPY_THRESHOLD env var.
 # Sends Telegram alerts with market links. User trades manually via Polymarket app.
 # Auto-trading temporarily disabled while Polymarket fixes their API bug.
 # To re-enable auto-trading after Polymarket fix: set SIGNALS_ONLY_MODE = False
@@ -912,23 +913,51 @@ def process_tick():
 
             hist = price_histories[ws_key]
             revs = count_reversals(hist)
+            recent_revs = count_reversals_recent(hist, seconds=30)
             mom = check_momentum(hist, dirn, CONFIG["momentum_checks"])
+            emoji = ASSET_EMOJI.get(asset, "")
+            arrow = "🔺" if dirn == "UP" else "🔻"
 
-            if revs > max_revs or not mom:
+            if revs > max_revs:
                 w["skipped"] = True
+                tg(
+                    f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+                    f"📈 Move: {pct:+.3f}%\n"
+                    f"🔄 Reason: Too many reversals in window ({revs}/{max_revs})\n"
+                    f"📊 30s reversals: {recent_revs}\n"
+                    f"⏱ {secs_left}s left"
+                )
+                continue
+
+            if not mom:
+                w["skipped"] = True
+                tg(
+                    f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+                    f"📈 Move: {pct:+.3f}%\n"
+                    f"📉 Reason: Momentum check failed\n"
+                    f"📊 30s reversals: {recent_revs}\n"
+                    f"⏱ {secs_left}s left"
+                )
                 continue
 
             # Choppy filter: skip if too many reversals in last 30 seconds
-            recent_revs = count_reversals_recent(hist, seconds=30)
             if recent_revs >= CONFIG["choppy_threshold"]:
                 w["skipped"] = True
+                tg(
+                    f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+                    f"📈 Move: {pct:+.3f}%\n"
+                    f"🌪 Reason: Too choppy ({recent_revs}/{CONFIG['choppy_threshold']} reversals in 30s)\n"
+                    f"⏱ {secs_left}s left"
+                )
                 log.info(f"Skipped {asset} {tf}m {dirn} - too choppy ({recent_revs} reversals in 30s)")
                 continue
 
-            enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time)
+            # Log the reversal counts for entered trades (for tuning the choppy threshold)
+            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%")
+            enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs, recent_revs)
 
 
-def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time):
+def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs=0, recent_revs=0):
     bet = min(CONFIG["bet_size"], state["balance_usd"])
     if bet < CONFIG["min_balance"]:
         return
@@ -964,6 +993,7 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
             f"🚨 <b>SIGNAL · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
             f"📈 Move: {pct:+.3f}%\n"
             f"⏱ {secs_left}s left\n"
+            f"📊 30s reversals: {recent_revs}/{CONFIG['choppy_threshold']}\n"
             f"💰 Polymarket ask: <b>{result['entry_cents']:.1f}¢</b>\n"
             f"📦 Would buy: {result['shares']} shares\n"
             f"💵 Cost: ${bet:.2f}\n\n"
@@ -1196,16 +1226,16 @@ def main():
     chainlink_ok = start_chainlink_threads()
 
     tg(
-        f"🚀 <b>PolySniper LIVE v3.3</b>\n"
+        f"🚀 <b>PolySniper LIVE v3.4</b>\n"
         f"🚨 <b>SIGNALS-ONLY MODE</b>\n\n"
         f"🟠 BTC · 🔷 ETH\n"
         f"⏱ 5min + 15min\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
-        f"📲 Alerts via Telegram\n"
+        f"📲 Alerts: signals + skips\n"
         f"👆 You trade manually\n"
         f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ Disabled'}\n"
         f"🌪 Choppy filter: skip if {CONFIG['choppy_threshold']}+ reversals in 30s\n\n"
-        f"<i>Auto-trading paused until Polymarket fixes API bug (ETA Tuesday)</i>\n\n"
+        f"<i>Auto-trading paused until Polymarket fixes API bug</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
