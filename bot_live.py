@@ -494,14 +494,14 @@ def chainlink_websocket_worker(asset):
             log.info(f"[Chainlink WS] Connecting for {asset} ({symbol})...")
             ws = websocket.create_connection(CHAINLINK_WS_URL, timeout=10)
 
-            # Subscribe with filters as plain string (per official docs)
+            # Subscribe with filters as JSON-encoded string (must start with { or [)
             subscribe_msg = {
                 "action": "subscribe",
                 "subscriptions": [
                     {
                         "topic": "crypto_prices_chainlink",
                         "type": "update",
-                        "filters": symbol
+                        "filters": json.dumps({"symbol": symbol})
                     }
                 ]
             }
