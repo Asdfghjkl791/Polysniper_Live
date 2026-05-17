@@ -492,6 +492,7 @@ def chainlink_websocket_worker(asset):
     if not symbol:
         return
 
+    msg_count = 0
     while True:
         try:
             log.info(f"[Chainlink WS] Connecting for {asset} ({symbol})...")
@@ -509,9 +510,10 @@ def chainlink_websocket_worker(asset):
                 ]
             }
             ws.send(json.dumps(subscribe_msg))
-            log.info(f"[Chainlink WS] Subscribed to {symbol}")
+            log.info(f"[Chainlink WS] {asset} subscribe sent: {json.dumps(subscribe_msg)}")
 
             last_ping = time.time()
+            last_log = time.time()
             ws.settimeout(10)
 
             while True:
@@ -524,15 +526,29 @@ def chainlink_websocket_worker(asset):
                     except:
                         break
 
+                # Log message rate every 30 seconds (debug)
+                if now - last_log >= 30:
+                    log.info(f"[Chainlink WS] {asset} received {msg_count} messages in last 30s")
+                    msg_count = 0
+                    last_log = now
+
                 try:
                     msg = ws.recv()
                     if not msg:
                         continue
 
+                    msg_count += 1
                     data = json.loads(msg)
-                    if data.get("topic") == "crypto_prices_chainlink" and data.get("type") == "update":
+
+                    # Log first few messages to see structure
+                    if msg_count <= 3:
+                        log.info(f"[Chainlink WS] {asset} msg #{msg_count}: {str(data)[:300]}")
+
+                    # Try multiple formats - Polymarket WS structure may have changed
+                    if data.get("topic") == "crypto_prices_chainlink":
                         payload = data.get("payload", {})
-                        if payload.get("symbol") == symbol:
+                        msg_symbol = payload.get("symbol", "")
+                        if msg_symbol == symbol or msg_symbol.lower() == symbol:
                             value = float(payload.get("value", 0))
                             if value > 0:
                                 prices_chainlink[asset] = value
