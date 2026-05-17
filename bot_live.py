@@ -47,7 +47,7 @@ ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB"]
 TIMEFRAMES = [5, 15]
 
 ASSET_THRESHOLDS_5 = {
-    "BTC":  float(os.environ.get("THRESHOLD_BTC_5",  "0.08")),
+    "BTC":  float(os.environ.get("THRESHOLD_BTC_5",  "0.09")),
     "ETH":  float(os.environ.get("THRESHOLD_ETH_5",  "0.10")),
     "SOL":  float(os.environ.get("THRESHOLD_SOL_5",  "0.15")),
     "DOGE": float(os.environ.get("THRESHOLD_DOGE_5", "0.20")),
@@ -1222,7 +1222,7 @@ def main():
     tg(
         f"✅ <b>Connected!</b>\n\n"
         f"💰 Balance: <b>${state['balance_usd']:.2f}</b>\n"
-        f"🎯 Watching BTC + ETH markets\n"
+        f"🎯 Watching {' + '.join(ASSET_LIST)} markets\n"
         f"🚨 Signals-only mode\n\n"
         f"You'll get a Telegram alert with market link when a signal fires.\n"
         f"Click the link to trade manually.\n\n"
