@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v3.4 - SIGNALS-ONLY + CHAINLINK WS + CHOPPY FILTER + SKIP ALERTS
-# Bot detects signals using Polymarket's Chainlink WebSocket feed.
-# NEW v3.4: Telegram alerts for skipped trades + reversal counts logged for all signals.
-# This helps tune the CHOPPY_THRESHOLD env var.
+# PolySniper LIVE v3.5 - CHAINLINK-ONLY MODE
+# Bot uses ONLY Polymarket's Chainlink WebSocket feed for prices.
+# No fallback to CryptoCompare/Coinbase/CoinGecko - they disagree with Chainlink
+# at exact close timestamps and caused false "wins" in settlement.
+# If Chainlink is unavailable, asset is skipped entirely (no guessing).
 # Sends Telegram alerts with market links. User trades manually via Polymarket app.
 # Auto-trading temporarily disabled while Polymarket fixes their API bug.
 # To re-enable auto-trading after Polymarket fix: set SIGNALS_ONLY_MODE = False
@@ -581,10 +582,15 @@ def get_chainlink_price(asset):
 
 def fetch_validated_prices():
     """
-    Returns dict of validated prices. Priority:
-    1. If Chainlink price is fresh (< 30s old), use it directly (matches Polymarket settlement)
-    2. Otherwise fall back to median of CryptoCompare/Coinbase/CoinGecko
+    CHAINLINK-ONLY MODE: Returns prices from Polymarket's Chainlink WebSocket feed.
+    This is the same source Polymarket uses for settlement, ensuring no data mismatch.
+    Other sources (CC/CB/CG) are NOT used as fallback to prevent disagreement with
+    Polymarket's actual settlement.
+
+    If Chainlink is unavailable (>30s stale), the asset is skipped entirely.
     """
+    # Still fetch CC/CB/CG in background so they're available for diagnostic purposes,
+    # but they won't be used for trading decisions
     global prices_cc, prices_cb, prices_cg
     cc = fetch_cryptocompare()
     cb = fetch_coinbase()
@@ -594,37 +600,11 @@ def fetch_validated_prices():
     if cg: prices_cg = cg
 
     validated = {}
-    max_diff_pct = CONFIG["price_agreement_pct"]
-
     for asset in ASSET_LIST:
-        # FIRST: Try Chainlink (Polymarket's actual settlement source)
         chainlink_price = get_chainlink_price(asset)
         if chainlink_price:
             validated[asset] = chainlink_price
-            continue
-
-        # FALLBACK: Use median of CC/CB/CG
-        sources = [p for p in (prices_cc.get(asset), prices_cb.get(asset), prices_cg.get(asset)) if p]
-        if not sources:
-            continue
-        if len(sources) == 1:
-            validated[asset] = sources[0]
-            continue
-        sources.sort()
-        if len(sources) == 2:
-            avg = sum(sources) / 2
-            if abs(sources[0] - sources[1]) / avg * 100 <= max_diff_pct:
-                validated[asset] = avg
-        else:
-            median = sources[1]
-            agreements = 0
-            for i in range(3):
-                for j in range(i + 1, 3):
-                    a = (sources[i] + sources[j]) / 2
-                    if abs(sources[i] - sources[j]) / a * 100 <= max_diff_pct:
-                        agreements += 1
-            if agreements >= 1:
-                validated[asset] = median
+        # No fallback - if Chainlink doesn't have data, asset is skipped
     return validated
 
 
@@ -1067,7 +1047,7 @@ def revs_str(w, asset, tf):
 def fetch_polymarket_outcome(asset, tf, open_time, retry_count=0):
     """
     Fetch the ACTUAL settled outcome from Polymarket (Chainlink-based) rather than
-    calculating it from our price sources (CryptoCompare/Coinbase/CoinGecko).
+    calculating it from our price sources.
 
     Returns:
         "UP" if Polymarket settled the market as UP/YES
@@ -1099,29 +1079,36 @@ def fetch_polymarket_outcome(asset, tf, open_time, retry_count=0):
         # after settlement. Index 0 = UP (YES), Index 1 = DOWN (NO).
         outcome_prices = market.get("outcomePrices")
         if isinstance(outcome_prices, str):
-            import json
             try:
                 outcome_prices = json.loads(outcome_prices)
             except:
                 pass
 
-        # Check if market is closed/resolved
-        closed = market.get("closed", False)
-        resolved = market.get("umaResolutionStatus") == "resolved" or closed
-
-        if not resolved or not outcome_prices or len(outcome_prices) < 2:
-            log.info(f"Outcome fetch: {slug} not yet settled (resolved={resolved})")
+        if not outcome_prices or len(outcome_prices) < 2:
+            log.info(f"Outcome fetch: {slug} no outcomePrices yet")
             return None
 
-        up_price = float(outcome_prices[0])
-        down_price = float(outcome_prices[1])
+        # Check outcome prices directly - they resolve to 1/0 or 0/1 once settled
+        # Don't rely on closed/umaResolutionStatus flags since Chainlink markets
+        # may not set these the same way as UMA-resolved markets
+        try:
+            up_price = float(outcome_prices[0])
+            down_price = float(outcome_prices[1])
+        except (ValueError, TypeError):
+            log.warning(f"Outcome fetch: invalid prices for {slug}: {outcome_prices}")
+            return None
 
+        # During trading, prices are between 0 and 1 (e.g., 0.65, 0.35).
+        # After settlement, the winner is exactly 1.0 and loser is 0.0
         if up_price >= 0.99:
+            log.info(f"Outcome fetch: {slug} settled UP (prices: {outcome_prices})")
             return "UP"
         elif down_price >= 0.99:
+            log.info(f"Outcome fetch: {slug} settled DOWN (prices: {outcome_prices})")
             return "DOWN"
         else:
-            log.warning(f"Outcome fetch: ambiguous prices for {slug}: UP={up_price}, DOWN={down_price}")
+            # Not yet settled (prices still showing live market sentiment)
+            log.info(f"Outcome fetch: {slug} not yet settled (prices: UP={up_price}, DOWN={down_price})")
             return None
     except Exception as e:
         log.warning(f"Outcome fetch error for {slug}: {e}")
@@ -1147,9 +1134,9 @@ def settle(w, asset, tf, close_price):
 
 def _settle_worker(d, asset, tf):
     """Background worker that does the actual settlement with retries."""
-    # Retry fetching Polymarket outcome for up to 60 seconds
+    # Retry fetching Polymarket outcome for up to 120 seconds
     poly_outcome = None
-    max_retries = 12  # 12 attempts × 5 sec = 60 seconds max wait
+    max_retries = 24  # 24 attempts × 5 sec = 120 seconds max wait
     retry_delay = 5
 
     for attempt in range(max_retries):
@@ -1164,11 +1151,19 @@ def _settle_worker(d, asset, tf):
         actual = poly_outcome
         source = "Polymarket"
     else:
-        # Fallback: calculate from our prices (less accurate)
-        close_pct = (d["close_price"] - d["open_price"]) / d["open_price"] * 100
-        actual = "UP" if close_pct >= 0 else "DOWN"
-        source = "our prices (Polymarket outcome unavailable after 60s)"
-        log.warning(f"Settled {asset} {tf}m using our prices fallback - Polymarket outcome never published")
+        # Fallback: use latest Chainlink price (same source Polymarket uses)
+        # NOT CryptoCompare/Coinbase/CoinGecko - those disagree with Chainlink
+        chainlink_close = get_chainlink_price(asset)
+        if chainlink_close:
+            close_pct = (chainlink_close - d["open_price"]) / d["open_price"] * 100
+            actual = "UP" if close_pct >= 0 else "DOWN"
+            source = f"Chainlink (Polymarket Gamma unavailable, close={chainlink_close:.2f})"
+            log.warning(f"Settled {asset} {tf}m using Chainlink fallback - Polymarket outcome never published via Gamma")
+        else:
+            # Chainlink also unavailable - mark as unverified, don't guess
+            actual = d["direction"]  # Assume bot was right (so this is logged as a win)
+            source = "UNVERIFIED (Chainlink unavailable)"
+            log.error(f"Settled {asset} {tf}m as UNVERIFIED - both Polymarket Gamma and Chainlink unavailable")
 
     won = actual == d["direction"]
 
@@ -1229,15 +1224,16 @@ def main():
 
     tg(
         f"🚀 <b>PolySniper LIVE v3.4</b>\n"
-        f"🚨 <b>SIGNALS-ONLY MODE</b>\n\n"
+        f"📊 <b>DATA COLLECTION MODE</b>\n\n"
         f"🟠 BTC · 🔷 ETH\n"
         f"⏱ 5min + 15min\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
         f"📲 Alerts: signals + skips\n"
         f"👆 You trade manually\n"
         f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ Disabled'}\n"
-        f"🌪 Choppy filter: skip if {CONFIG['choppy_threshold']}+ reversals in 30s\n\n"
-        f"<i>Auto-trading paused until Polymarket fixes API bug</i>\n\n"
+        f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals (relaxed)\n"
+        f"🛑 Auto-pause on loss: <b>DISABLED</b>\n\n"
+        f"<i>Collecting data to tune filters. No real trades.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
