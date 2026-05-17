@@ -43,16 +43,22 @@ POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "").strip()
 POLY_FUNDER      = os.environ.get("POLY_FUNDER", "").strip()
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-ASSET_LIST = ["BTC", "ETH"]   # Only BTC + ETH for live
+ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB"]
 TIMEFRAMES = [5, 15]
 
 ASSET_THRESHOLDS_5 = {
     "BTC":  float(os.environ.get("THRESHOLD_BTC_5",  "0.08")),
     "ETH":  float(os.environ.get("THRESHOLD_ETH_5",  "0.10")),
+    "SOL":  float(os.environ.get("THRESHOLD_SOL_5",  "0.15")),
+    "DOGE": float(os.environ.get("THRESHOLD_DOGE_5", "0.20")),
+    "BNB":  float(os.environ.get("THRESHOLD_BNB_5",  "0.12")),
 }
 ASSET_THRESHOLDS_15 = {
     "BTC":  float(os.environ.get("THRESHOLD_BTC_15", "0.15")),
     "ETH":  float(os.environ.get("THRESHOLD_ETH_15", "0.20")),
+    "SOL":  float(os.environ.get("THRESHOLD_SOL_15", "0.30")),
+    "DOGE": float(os.environ.get("THRESHOLD_DOGE_15", "0.40")),
+    "BNB":  float(os.environ.get("THRESHOLD_BNB_15", "0.25")),
 }
 
 MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "20"))
@@ -71,10 +77,10 @@ CONFIG = {
     "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "20")),
 }
 
-ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷"}
+ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡", "BNB": "🟨"}
 
-COINBASE_PRODUCTS = {"BTC": "BTC-USD", "ETH": "ETH-USD"}
-COINGECKO_IDS     = {"BTC": "bitcoin",  "ETH": "ethereum"}
+COINBASE_PRODUCTS = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD", "DOGE": "DOGE-USD", "BNB": "BNB-USD"}
+COINGECKO_IDS     = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "DOGE": "dogecoin", "BNB": "binancecoin"}
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -432,50 +438,26 @@ def check_balance(force=False):
 
 # ─── PRICE FEEDS ─────────────────────────────────────────────────────────────
 def fetch_cryptocompare():
-    try:
-        symbols = ",".join(ASSET_LIST)
-        url = f"https://min-api.cryptocompare.com/data/pricemulti?fsyms={symbols}&tsyms=USD"
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        return {sym: float(data[sym]["USD"]) for sym in ASSET_LIST if sym in data and "USD" in data[sym]}
-    except Exception as e:
-        log.warning(f"CC failed: {e}")
-        return {}
+    return {}  # Disabled in Chainlink-only mode
 
 
 def fetch_coinbase():
-    result = {}
-    for asset, product in COINBASE_PRODUCTS.items():
-        try:
-            url = f"https://api.coinbase.com/v2/prices/{product}/spot"
-            res = requests.get(url, timeout=5)
-            data = res.json()
-            if "data" in data and "amount" in data["data"]:
-                result[asset] = float(data["data"]["amount"])
-        except:
-            pass
-    return result
+    return {}  # Disabled in Chainlink-only mode
 
 
 def fetch_coingecko():
-    try:
-        ids = ",".join(COINGECKO_IDS.values())
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        result = {}
-        for asset, gid in COINGECKO_IDS.items():
-            if gid in data and "usd" in data[gid]:
-                result[asset] = float(data[gid]["usd"])
-        return result
-    except Exception as e:
-        log.warning(f"CG failed: {e}")
-        return {}
+    return {}  # Disabled in Chainlink-only mode
 
 
 # ─── CHAINLINK WEBSOCKET (Polymarket's actual settlement source) ─────────────
 CHAINLINK_WS_URL = "wss://ws-live-data.polymarket.com"
-CHAINLINK_SYMBOLS = {"BTC": "btc/usd", "ETH": "eth/usd"}
+CHAINLINK_SYMBOLS = {
+    "BTC":  "btc/usd",
+    "ETH":  "eth/usd",
+    "SOL":  "sol/usd",
+    "DOGE": "doge/usd",
+    "BNB":  "bnb/usd",
+}
 chainlink_last_update = {}  # Track when we last got a price for each asset
 
 
@@ -588,23 +570,12 @@ def get_chainlink_price(asset):
 
 def fetch_validated_prices():
     """
-    CHAINLINK-ONLY MODE: Returns prices from Polymarket's Chainlink WebSocket feed.
+    CHAINLINK-ONLY MODE: Returns prices from Polymarket's Chainlink WebSocket feed ONLY.
     This is the same source Polymarket uses for settlement, ensuring no data mismatch.
-    Other sources (CC/CB/CG) are NOT used as fallback to prevent disagreement with
-    Polymarket's actual settlement.
 
     If Chainlink is unavailable (>30s stale), the asset is skipped entirely.
+    No fallback to CryptoCompare/Coinbase/CoinGecko.
     """
-    # Still fetch CC/CB/CG in background so they're available for diagnostic purposes,
-    # but they won't be used for trading decisions
-    global prices_cc, prices_cb, prices_cg
-    cc = fetch_cryptocompare()
-    cb = fetch_coinbase()
-    cg = fetch_coingecko()
-    if cc: prices_cc = cc
-    if cb: prices_cb = cb
-    if cg: prices_cg = cg
-
     validated = {}
     for asset in ASSET_LIST:
         chainlink_price = get_chainlink_price(asset)
@@ -692,7 +663,7 @@ def find_market_for_window(asset, tf, open_time):
       eth-updown-15m-{timestamp}
     Note: the slug is an EVENT slug. We query /events?slug=... and pull markets from inside.
     """
-    asset_short = {"BTC": "btc", "ETH": "eth"}.get(asset)
+    asset_short = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "DOGE": "doge", "BNB": "bnb"}.get(asset)
     if not asset_short:
         return None, None, None
 
@@ -791,7 +762,7 @@ def place_order(asset, tf, direction, bet_size, open_time):
 
         if SIGNALS_ONLY_MODE:
             # Build market URL for manual trading
-            asset_short = {"BTC": "btc", "ETH": "eth"}.get(asset, asset.lower())
+            asset_short = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "DOGE": "doge", "BNB": "bnb"}.get(asset, asset.lower())
             window_ts = int(open_time.timestamp())
             market_url = f"https://polymarket.com/event/{asset_short}-updown-{tf}m-{window_ts}"
             return {
@@ -1060,7 +1031,7 @@ def fetch_polymarket_outcome(asset, tf, open_time, retry_count=0):
         "DOWN" if Polymarket settled as DOWN/NO
         None if not yet settled or error
     """
-    asset_short = {"BTC": "btc", "ETH": "eth"}.get(asset)
+    asset_short = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "DOGE": "doge", "BNB": "bnb"}.get(asset)
     if not asset_short:
         return None
 
@@ -1231,7 +1202,7 @@ def main():
     tg(
         f"🚀 <b>PolySniper LIVE v3.5</b>\n"
         f"🔗 <b>CHAINLINK-ONLY MODE</b>\n\n"
-        f"🟠 BTC · 🔷 ETH\n"
+        f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
         f"⏱ 5min + 15min\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
         f"📲 Alerts: signals + skips\n"
@@ -1239,8 +1210,7 @@ def main():
         f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED - bot will not trade'}\n"
         f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n"
         f"🛑 Auto-pause on loss: <b>DISABLED</b>\n\n"
-        f"<i>Only uses Chainlink data — same source Polymarket uses.</i>\n"
-        f"<i>No fallback to CC/CB/CG to prevent settlement disagreements.</i>\n\n"
+        f"<i>Only uses Chainlink data — same source Polymarket uses.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
