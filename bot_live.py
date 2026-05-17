@@ -67,7 +67,7 @@ CONFIG = {
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
     "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "85.0")),
     "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "99.9")),
-    "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "6")),
+    "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "20")),
 }
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷"}
@@ -1211,10 +1211,12 @@ def _settle_worker(d, asset, tf):
         f"📊 {total} · {wr} · ${total_pnl:+.2f}"
     )
 
-    if not won:
-        state["paused"] = True
-        state["pause_reason"] = f"Loss on {asset} {tf}m"
-        tg(f"⏸ <b>Auto-paused after loss</b>\n/resume when ready.")
+    # Auto-pause on loss DISABLED for data collection mode.
+    # Re-enable by uncommenting these 3 lines when ready to trade real money:
+    # if not won:
+    #     state["paused"] = True
+    #     state["pause_reason"] = f"Loss on {asset} {tf}m"
+    #     tg(f"⏸ <b>Auto-paused after loss</b>\n/resume when ready.")
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
