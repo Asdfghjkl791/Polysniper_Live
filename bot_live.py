@@ -482,11 +482,7 @@ chainlink_last_update = {}  # Track when we last got a price for each asset
 def chainlink_websocket_worker(asset):
     """
     Background thread that maintains a WebSocket connection to Polymarket's Chainlink
-    price feed for ONE asset. Polymarket's WS only supports one symbol per connection,
-    so we run a separate thread for each asset (BTC, ETH).
-
-    Updates prices_chainlink[asset] continuously with the latest Chainlink price.
-    Auto-reconnects on disconnect.
+    price feed. Polymarket sends snapshot + continuous live updates after subscribe.
     """
     symbol = CHAINLINK_SYMBOLS.get(asset)
     if not symbol:
@@ -498,14 +494,14 @@ def chainlink_websocket_worker(asset):
             log.info(f"[Chainlink WS] Connecting for {asset} ({symbol})...")
             ws = websocket.create_connection(CHAINLINK_WS_URL, timeout=10)
 
-            # Subscribe to Chainlink crypto prices for this symbol
+            # Subscribe with filters as plain string (per official docs)
             subscribe_msg = {
                 "action": "subscribe",
                 "subscriptions": [
                     {
                         "topic": "crypto_prices_chainlink",
-                        "type": "*",
-                        "filters": json.dumps({"symbol": symbol})
+                        "type": "update",
+                        "filters": symbol
                     }
                 ]
             }
@@ -514,21 +510,20 @@ def chainlink_websocket_worker(asset):
 
             last_ping = time.time()
             last_log = time.time()
-            ws.settimeout(10)
+            ws.settimeout(2)  # Shorter timeout so we can ping more often
 
             while True:
-                # Send ping every 5 seconds to keep connection alive
                 now = time.time()
                 if now - last_ping >= 5:
                     try:
                         ws.send(json.dumps({"action": "ping"}))
                         last_ping = now
-                    except:
+                    except Exception as e:
+                        log.warning(f"[Chainlink WS] {asset} ping failed: {e}")
                         break
 
-                # Log message rate every 30 seconds (debug)
                 if now - last_log >= 30:
-                    log.info(f"[Chainlink WS] {asset} received {msg_count} messages in last 30s")
+                    log.info(f"[Chainlink WS] {asset} got {msg_count} msgs in 30s. Price: {prices_chainlink.get(asset, 'NONE')}")
                     msg_count = 0
                     last_log = now
 
@@ -536,33 +531,39 @@ def chainlink_websocket_worker(asset):
                     msg = ws.recv()
                     if not msg:
                         continue
-
                     msg_count += 1
                     data = json.loads(msg)
 
-                    # Log first few messages to see structure
                     if msg_count <= 3:
-                        log.info(f"[Chainlink WS] {asset} msg #{msg_count}: {str(data)[:300]}")
+                        log.info(f"[Chainlink WS] {asset} msg #{msg_count}: {str(data)[:400]}")
 
-                    # Try multiple formats - Polymarket WS structure may have changed
-                    if data.get("topic") == "crypto_prices_chainlink":
-                        payload = data.get("payload", {})
-                        msg_symbol = payload.get("symbol", "")
-                        if msg_symbol == symbol or msg_symbol.lower() == symbol:
+                    # Handle both formats:
+                    # Snapshot:  payload.data = [{timestamp, value}, ...]
+                    # Update:    payload = {symbol, timestamp, value}
+                    payload = data.get("payload", {})
+                    if isinstance(payload, dict):
+                        data_arr = payload.get("data")
+                        if isinstance(data_arr, list) and data_arr:
+                            latest = data_arr[-1]
+                            if isinstance(latest, dict):
+                                value = float(latest.get("value", 0))
+                                if value > 0:
+                                    prices_chainlink[asset] = value
+                                    chainlink_last_update[asset] = time.time()
+                        elif "value" in payload:
                             value = float(payload.get("value", 0))
                             if value > 0:
                                 prices_chainlink[asset] = value
                                 chainlink_last_update[asset] = time.time()
                 except websocket.WebSocketTimeoutException:
-                    continue  # Timeout is okay, keep listening
+                    continue
                 except Exception as e:
-                    log.warning(f"[Chainlink WS] {asset} message error: {e}")
+                    log.warning(f"[Chainlink WS] {asset} recv error: {e}")
                     break
 
         except Exception as e:
             log.error(f"[Chainlink WS] {asset} connection error: {e}")
 
-        # Reconnect after 5 seconds
         try:
             ws.close()
         except:
