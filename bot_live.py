@@ -871,7 +871,6 @@ def process_tick():
             hist = price_histories[ws_key]
             revs = count_reversals(hist)
             recent_revs = count_reversals_recent(hist, seconds=30)
-            mom = check_momentum(hist, dirn, CONFIG["momentum_checks"])
             emoji = ASSET_EMOJI.get(asset, "")
             arrow = "🔺" if dirn == "UP" else "🔻"
 
@@ -886,16 +885,9 @@ def process_tick():
                 )
                 continue
 
-            if not mom:
-                w["skipped"] = True
-                tg(
-                    f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-                    f"📈 Move: {pct:+.3f}%\n"
-                    f"📉 Reason: Momentum check failed\n"
-                    f"📊 30s reversals: {recent_revs}\n"
-                    f"⏱ {secs_left}s left"
-                )
-                continue
+            # Momentum check removed in v3.5.5 - too aggressive, blocked strong signals
+            # over single-tick bounces. Reversal filters above + choppy filter below
+            # already protect against noise.
 
             # Choppy filter: skip if too many reversals in last 30 seconds
             if recent_revs >= CONFIG["choppy_threshold"]:
