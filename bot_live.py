@@ -891,9 +891,17 @@ def process_tick():
 
             # Conviction check (5min only): skip if move is weakening significantly (reversal in progress)
             # Compares move % now vs move % ~30 seconds ago
-            # Only skips if the move has shrunk by more than WEAKENING_TOLERANCE (default 0.05%)
+            # Tolerance is per-asset (ETH is tighter due to more losses)
             if tf == 5:
-                weakening_tolerance = float(os.environ.get("WEAKENING_TOLERANCE", "0.05"))
+                # Per-asset weakening tolerance (in % points)
+                weakening_tolerance_map = {
+                    "BTC":  float(os.environ.get("WEAKENING_TOLERANCE_BTC",  "0.05")),
+                    "ETH":  float(os.environ.get("WEAKENING_TOLERANCE_ETH",  "0.025")),
+                    "SOL":  float(os.environ.get("WEAKENING_TOLERANCE_SOL",  "0.05")),
+                    "DOGE": float(os.environ.get("WEAKENING_TOLERANCE_DOGE", "0.05")),
+                    "BNB":  float(os.environ.get("WEAKENING_TOLERANCE_BNB",  "0.05")),
+                }
+                weakening_tolerance = weakening_tolerance_map.get(asset, 0.05)
                 if len(hist) >= 30:
                     price_30s_ago = list(hist)[-30]
                     move_30s_ago = (price_30s_ago - w["open_price"]) / w["open_price"] * 100
@@ -906,7 +914,7 @@ def process_tick():
                             f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
                             f"📈 Move now: {pct:+.3f}%\n"
                             f"📉 Move 30s ago: {move_30s_ago:+.3f}%\n"
-                            f"⚠️ Reason: Move weakening by {weakening:.3f}% (reversal in progress)\n"
+                            f"⚠️ Reason: Move weakening by {weakening:.3f}% (>{weakening_tolerance:.3f}% tolerance)\n"
                             f"📊 30s reversals: {recent_revs}\n"
                             f"⏱ {secs_left}s left"
                         )
