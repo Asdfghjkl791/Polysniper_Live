@@ -843,7 +843,7 @@ def process_tick():
             absp = abs(pct)
             dirn = "UP" if pct >= 0 else "DOWN"
 
-           if w["traded"] or w["skipped"]:
+            if w["traded"] or w["skipped"]:
                 continue
 
             # Per-asset-per-tf entry window (ETH 5m is tighter)
