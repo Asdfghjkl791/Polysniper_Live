@@ -889,27 +889,28 @@ def process_tick():
             # over single-tick bounces. Reversal filters above + choppy filter below
             # already protect against noise.
 
-            # Conviction check: skip if move is weakening significantly (reversal in progress)
+            # Conviction check (5min only): skip if move is weakening significantly (reversal in progress)
             # Compares move % now vs move % ~30 seconds ago
             # Only skips if the move has shrunk by more than WEAKENING_TOLERANCE (default 0.05%)
-            weakening_tolerance = float(os.environ.get("WEAKENING_TOLERANCE", "0.05"))
-            if len(hist) >= 30:
-                price_30s_ago = list(hist)[-30]
-                move_30s_ago = (price_30s_ago - w["open_price"]) / w["open_price"] * 100
-                weakening = abs(move_30s_ago) - abs(pct)
-                # Same direction check (both negative for DOWN, both positive for UP)
-                same_direction = (move_30s_ago < 0 and pct < 0) or (move_30s_ago > 0 and pct > 0)
-                if same_direction and weakening > weakening_tolerance:
-                    w["skipped"] = True
-                    tg(
-                        f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-                        f"📈 Move now: {pct:+.3f}%\n"
-                        f"📉 Move 30s ago: {move_30s_ago:+.3f}%\n"
-                        f"⚠️ Reason: Move weakening by {weakening:.3f}% (reversal in progress)\n"
-                        f"📊 30s reversals: {recent_revs}\n"
-                        f"⏱ {secs_left}s left"
-                    )
-                    continue
+            if tf == 5:
+                weakening_tolerance = float(os.environ.get("WEAKENING_TOLERANCE", "0.05"))
+                if len(hist) >= 30:
+                    price_30s_ago = list(hist)[-30]
+                    move_30s_ago = (price_30s_ago - w["open_price"]) / w["open_price"] * 100
+                    weakening = abs(move_30s_ago) - abs(pct)
+                    # Same direction check (both negative for DOWN, both positive for UP)
+                    same_direction = (move_30s_ago < 0 and pct < 0) or (move_30s_ago > 0 and pct > 0)
+                    if same_direction and weakening > weakening_tolerance:
+                        w["skipped"] = True
+                        tg(
+                            f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+                            f"📈 Move now: {pct:+.3f}%\n"
+                            f"📉 Move 30s ago: {move_30s_ago:+.3f}%\n"
+                            f"⚠️ Reason: Move weakening by {weakening:.3f}% (reversal in progress)\n"
+                            f"📊 30s reversals: {recent_revs}\n"
+                            f"⏱ {secs_left}s left"
+                        )
+                        continue
 
             # Choppy filter: skip if too many reversals in last 30 seconds
             if recent_revs >= CONFIG["choppy_threshold"]:
