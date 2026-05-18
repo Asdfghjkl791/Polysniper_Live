@@ -843,11 +843,23 @@ def process_tick():
             absp = abs(pct)
             dirn = "UP" if pct >= 0 else "DOWN"
 
-            if w["traded"] or w["skipped"]:
+           if w["traded"] or w["skipped"]:
                 continue
-            if secs_left <= 0 or secs_left > CONFIG["entry_window_seconds"]:
+
+            # Per-asset-per-tf entry window (ETH 5m is tighter)
+            entry_window = CONFIG["entry_window_seconds"]
+            if asset == "ETH" and tf == 5:
+                entry_window = int(os.environ.get("ENTRY_SECS_ETH_5", "40"))
+
+            if secs_left <= 0 or secs_left > entry_window:
                 continue
-            if absp < threshold:
+
+            # Per-asset threshold override (ETH 5m needs stronger moves)
+            effective_threshold = threshold
+            if asset == "ETH" and tf == 5:
+                effective_threshold = float(os.environ.get("THRESHOLD_ETH_5_STRICT", "0.13"))
+
+            if absp < effective_threshold:
                 continue
             if state["paused"]:
                 continue
