@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v3.6 - CHAINLINK-ONLY + CONVICTION CHECK
-# Bot uses ONLY Polymarket's Chainlink WebSocket feed for prices.
-# No fallback to CryptoCompare/Coinbase/CoinGecko - they disagree with Chainlink
-# at exact close timestamps and caused false "wins" in settlement.
-# If Chainlink is unavailable, asset is skipped entirely (no guessing).
-# Sends Telegram alerts with market links. User trades manually via Polymarket app.
-# Auto-trading temporarily disabled while Polymarket fixes their API bug.
-# To re-enable auto-trading after Polymarket fix: set SIGNALS_ONLY_MODE = False
+# PolySniper LIVE v3.7 - EARLY ENTRY TEST (SIGNALS ONLY)
+# Tests new entry strategy: enter EARLIER (last 2 min) at CHEAPER prices (65-85¢)
+# Still signals-only mode so you can see results without risking real money.
+# Math benefit: each win pays 15-35¢ profit vs 1¢ at 99¢ entries.
+# If results look good, deploy to v4.0 with auto-trading enabled.
 
 import os
 import time
@@ -66,14 +63,14 @@ MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "40"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
-    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "50")),
+    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "120")),
     "retry_interval_secs":  int(os.environ.get("RETRY_INTERVAL", "5")),
     "momentum_checks":      int(os.environ.get("MOMENTUM_CHECKS", "1")),
     "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
     "price_interval_secs":  5,
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
-    "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "85.0")),
-    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "99.9")),
+    "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "65.0")),
+    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "85.0")),
     "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "20")),
 }
 
@@ -1235,7 +1232,22 @@ def main():
     chainlink_ok = start_chainlink_threads()
 
     tg(
-        f"🚀 <b>PolySniper LIVE v3.6</b>\n"
+    tg(
+        f"🚀 <b>PolySniper LIVE v3.7</b>\n"
+        f"🎯 <b>EARLY ENTRY TEST</b>\n"
+        f"📲 Signals-only mode\n\n"
+        f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
+        f"⏱ 5min + 15min\n"
+        f"💵 Bet size: ${CONFIG['bet_size']}\n"
+        f"⏰ Entry window: last {CONFIG['entry_window_seconds']}s\n"
+        f"💲 Entry range: <b>{CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢</b>\n"
+        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n"
+        f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n\n"
+        f"<i>Testing earlier entries at cheaper prices.</i>\n"
+        f"<i>You trade manually via market links.</i>\n\n"
+        f"🕐 {est_full()}\n\n"
+        f"Connecting to Polymarket..."
+    )
         f"🔗 <b>CHAINLINK-ONLY MODE</b>\n\n"
         f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
         f"⏱ 5min + 15min\n"
