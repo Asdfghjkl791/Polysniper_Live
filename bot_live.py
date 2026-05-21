@@ -1232,7 +1232,6 @@ def main():
     chainlink_ok = start_chainlink_threads()
 
     tg(
-    tg(
         f"🚀 <b>PolySniper LIVE v3.7</b>\n"
         f"🎯 <b>EARLY ENTRY TEST</b>\n"
         f"📲 Signals-only mode\n\n"
@@ -1245,19 +1244,6 @@ def main():
         f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n\n"
         f"<i>Testing earlier entries at cheaper prices.</i>\n"
         f"<i>You trade manually via market links.</i>\n\n"
-        f"🕐 {est_full()}\n\n"
-        f"Connecting to Polymarket..."
-    )
-        f"🔗 <b>CHAINLINK-ONLY MODE</b>\n\n"
-        f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
-        f"⏱ 5min + 15min\n"
-        f"💵 Bet size: ${CONFIG['bet_size']}\n"
-        f"📲 Alerts: signals + skips\n"
-        f"👆 You trade manually\n"
-        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED - bot will not trade'}\n"
-        f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n"
-        f"🛑 Auto-pause on loss: <b>DISABLED</b>\n\n"
-        f"<i>Only uses Chainlink data — same source Polymarket uses.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
