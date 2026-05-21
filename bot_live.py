@@ -44,11 +44,11 @@ ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB"]
 TIMEFRAMES = [5, 15]
 
 ASSET_THRESHOLDS_5 = {
-    "BTC":  float(os.environ.get("THRESHOLD_BTC_5",  "0.09")),
-    "ETH":  float(os.environ.get("THRESHOLD_ETH_5",  "0.10")),
-    "SOL":  float(os.environ.get("THRESHOLD_SOL_5",  "0.15")),
-    "DOGE": float(os.environ.get("THRESHOLD_DOGE_5", "0.20")),
-    "BNB":  float(os.environ.get("THRESHOLD_BNB_5",  "0.12")),
+    "BTC":  float(os.environ.get("THRESHOLD_BTC_5",  "0.07")),
+    "ETH":  float(os.environ.get("THRESHOLD_ETH_5",  "0.08")),
+    "SOL":  float(os.environ.get("THRESHOLD_SOL_5",  "0.12")),
+    "DOGE": float(os.environ.get("THRESHOLD_DOGE_5", "0.15")),
+    "BNB":  float(os.environ.get("THRESHOLD_BNB_5",  "0.10")),
 }
 ASSET_THRESHOLDS_15 = {
     "BTC":  float(os.environ.get("THRESHOLD_BTC_15", "0.15")),
@@ -63,7 +63,8 @@ MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "40"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
-    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "120")),
+    "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "180")),
+    "entry_min_seconds":    int(os.environ.get("ENTRY_MIN_SECS", "60")),
     "retry_interval_secs":  int(os.environ.get("RETRY_INTERVAL", "5")),
     "momentum_checks":      int(os.environ.get("MOMENTUM_CHECKS", "1")),
     "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
@@ -845,16 +846,19 @@ def process_tick():
 
             # Per-asset-per-tf entry window (ETH 5m is tighter)
             entry_window = CONFIG["entry_window_seconds"]
+            entry_min = CONFIG["entry_min_seconds"]
             if asset == "ETH" and tf == 5:
-                entry_window = int(os.environ.get("ENTRY_SECS_ETH_5", "40"))
+                entry_window = int(os.environ.get("ENTRY_SECS_ETH_5", "180"))
 
-            if secs_left <= 0 or secs_left > entry_window:
+            # Only fire signals when secs_left is between entry_min and entry_window
+            # (i.e. window must be closing within entry_window but more than entry_min seconds away)
+            if secs_left <= entry_min or secs_left > entry_window:
                 continue
 
             # Per-asset threshold override (ETH 5m needs stronger moves)
             effective_threshold = threshold
             if asset == "ETH" and tf == 5:
-                effective_threshold = float(os.environ.get("THRESHOLD_ETH_5_STRICT", "0.13"))
+                effective_threshold = float(os.environ.get("THRESHOLD_ETH_5_STRICT", "0.10"))
 
             if absp < effective_threshold:
                 continue
@@ -1238,7 +1242,7 @@ def main():
         f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
         f"⏱ 5min + 15min\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
-        f"⏰ Entry window: last {CONFIG['entry_window_seconds']}s\n"
+        f"⏰ Entry window: {CONFIG['entry_min_seconds']}-{CONFIG['entry_window_seconds']}s before close\n"
         f"💲 Entry range: <b>{CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢</b>\n"
         f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n"
         f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n\n"
