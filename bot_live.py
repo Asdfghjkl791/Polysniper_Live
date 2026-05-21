@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-# PolySniper LIVE v3.7 - EARLY ENTRY TEST (SIGNALS ONLY)
-# Tests new entry strategy: enter EARLIER (last 2 min) at CHEAPER prices (65-85¢)
-# Still signals-only mode so you can see results without risking real money.
-# Math benefit: each win pays 15-35¢ profit vs 1¢ at 99¢ entries.
-# If results look good, deploy to v4.0 with auto-trading enabled.
+# PolySniper LIVE v3.8 - SIMPLIFIED TEST (NO FILTERS)
+# Pure price-range test: enter ANY side (UP or DOWN) if Polymarket ask is
+# between 65-85¢ during the entry window. No move thresholds, no reversal
+# filters, no conviction check. Just price + timing.
+# 5m: last 180s (3 min) of window
+# 15m: last 300s (5 min) of window
+# Goal: collect data on natural win rate at 65-85¢ entries.
 
 import os
 import time
@@ -807,17 +809,24 @@ def place_order(asset, tf, direction, bet_size, open_time):
 
 # ─── TRADING LOOP ────────────────────────────────────────────────────────────
 def process_tick():
+    """
+    EXPERIMENTAL v3.7 SIMPLIFIED MODE:
+    - No move thresholds
+    - No reversal/conviction/choppy filters
+    - Just: if Polymarket ask is in [min_entry_cents, max_entry_cents] range
+      during the time window, enter that side
+    - Tries BOTH UP and DOWN sides every tick
+    - 5m: last entry_window_seconds of the window (default 180s = full last 3 min)
+    - 15m: last entry_window_seconds_15 of the window (default 300s = full last 5 min)
+    """
     for tf in TIMEFRAMES:
         open_time, close_time, secs_left = get_window_times(tf)
-        thresh = ASSET_THRESHOLDS_5 if tf == 5 else ASSET_THRESHOLDS_15
-        max_revs = MAX_REVERSALS_5 if tf == 5 else MAX_REVERSALS_15
 
         for asset in ASSET_LIST:
             price = prices.get(asset)
             if not price:
                 continue
 
-            threshold = thresh[asset]
             wk_key = wkey(asset, tf, open_time)
             ws_key = (asset, tf)
 
@@ -838,116 +847,112 @@ def process_tick():
             price_histories[ws_key].append(price)
             w = windows[ws_key]
             pct = (price - w["open_price"]) / w["open_price"] * 100
-            absp = abs(pct)
-            dirn = "UP" if pct >= 0 else "DOWN"
 
             if w["traded"] or w["skipped"]:
                 continue
 
-            # Per-asset-per-tf entry window (ETH 5m is tighter)
-            entry_window = CONFIG["entry_window_seconds"]
-            entry_min = CONFIG["entry_min_seconds"]
-            if asset == "ETH" and tf == 5:
-                entry_window = int(os.environ.get("ENTRY_SECS_ETH_5", "180"))
+            # Entry window: 5m = last 180s (3 min), 15m = last 300s (5 min)
+            if tf == 5:
+                entry_window = int(os.environ.get("ENTRY_SECS", "180"))
+            else:
+                entry_window = int(os.environ.get("ENTRY_SECS_15", "300"))
 
-            # Only fire signals when secs_left is between entry_min and entry_window
-            # (i.e. window must be closing within entry_window but more than entry_min seconds away)
-            if secs_left <= entry_min or secs_left > entry_window:
-                continue
-
-            # Per-asset threshold override (ETH 5m needs stronger moves)
-            effective_threshold = threshold
-            if asset == "ETH" and tf == 5:
-                effective_threshold = float(os.environ.get("THRESHOLD_ETH_5_STRICT", "0.10"))
-
-            if absp < effective_threshold:
+            if secs_left <= 0 or secs_left > entry_window:
                 continue
             if state["paused"]:
                 continue
             if state["balance_usd"] < CONFIG["min_balance"]:
-                state["paused"] = True
-                state["pause_reason"] = "Balance too low"
-                tg(f"🛑 <b>Balance ${state['balance_usd']:.2f} < ${CONFIG['min_balance']}</b>\nPaused.")
                 continue
 
-            # Rate-limit retry attempts - only try every N seconds
+            # Rate-limit retry attempts - only check every N seconds
             now_ts = time.time()
             if now_ts - w["last_retry_at"] < CONFIG["retry_interval_secs"]:
                 continue
             w["last_retry_at"] = now_ts
 
-            corr_ok, corr_reason = check_correlation(asset, dirn)
-            if not corr_ok:
-                w["skipped"] = True
+            # Check both UP and DOWN sides - whichever is in 65-85c range, take it
+            condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
+            if not up_token or not down_token:
                 continue
 
-            hist = price_histories[ws_key]
-            revs = count_reversals(hist)
-            recent_revs = count_reversals_recent(hist, seconds=30)
-            emoji = ASSET_EMOJI.get(asset, "")
-            arrow = "🔺" if dirn == "UP" else "🔻"
+            min_c = CONFIG["min_entry_cents"]
+            max_c = CONFIG["max_entry_cents"]
 
-            if revs > max_revs:
-                w["skipped"] = True
-                tg(
-                    f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-                    f"📈 Move: {pct:+.3f}%\n"
-                    f"🔄 Reason: Too many reversals in window ({revs}/{max_revs})\n"
-                    f"📊 30s reversals: {recent_revs}\n"
-                    f"⏱ {secs_left}s left"
-                )
-                continue
-
-            # Momentum check removed in v3.5.5 - too aggressive, blocked strong signals
-            # over single-tick bounces. Reversal filters above + choppy filter below
-            # already protect against noise.
-
-            # Conviction check (5min only): skip if move is weakening significantly (reversal in progress)
-            # Compares move % now vs move % ~30 seconds ago
-            # Tolerance is per-asset (ETH is tighter due to more losses)
-            if tf == 5:
-                # Per-asset weakening tolerance (in % points)
-                weakening_tolerance_map = {
-                    "BTC":  float(os.environ.get("WEAKENING_TOLERANCE_BTC",  "0.08")),
-                    "ETH":  float(os.environ.get("WEAKENING_TOLERANCE_ETH",  "0.05")),
-                    "SOL":  float(os.environ.get("WEAKENING_TOLERANCE_SOL",  "0.08")),
-                    "DOGE": float(os.environ.get("WEAKENING_TOLERANCE_DOGE", "0.08")),
-                    "BNB":  float(os.environ.get("WEAKENING_TOLERANCE_BNB",  "0.08")),
-                }
-                weakening_tolerance = weakening_tolerance_map.get(asset, 0.05)
-                if len(hist) >= 30:
-                    price_30s_ago = list(hist)[-30]
-                    move_30s_ago = (price_30s_ago - w["open_price"]) / w["open_price"] * 100
-                    weakening = abs(move_30s_ago) - abs(pct)
-                    # Same direction check (both negative for DOWN, both positive for UP)
-                    same_direction = (move_30s_ago < 0 and pct < 0) or (move_30s_ago > 0 and pct > 0)
-                    if same_direction and weakening > weakening_tolerance:
-                        w["skipped"] = True
-                        tg(
-                            f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-                            f"📈 Move now: {pct:+.3f}%\n"
-                            f"📉 Move 30s ago: {move_30s_ago:+.3f}%\n"
-                            f"⚠️ Reason: Move weakening by {weakening:.3f}% (>{weakening_tolerance:.3f}% tolerance)\n"
-                            f"📊 30s reversals: {recent_revs}\n"
-                            f"⏱ {secs_left}s left"
-                        )
+            for dirn, token_id in [("UP", up_token), ("DOWN", down_token)]:
+                try:
+                    book = clob_client.get_order_book(token_id)
+                    if not book:
                         continue
+                    if isinstance(book, dict):
+                        asks = book.get("asks", [])
+                    else:
+                        asks = getattr(book, "asks", [])
+                    if not asks:
+                        continue
+                    first_ask = asks[0]
+                    if isinstance(first_ask, dict):
+                        ask_price = float(first_ask.get("price", 0))
+                    else:
+                        ask_price = float(getattr(first_ask, "price", 0))
+                    if ask_price <= 0:
+                        continue
+                    ask_cents = ask_price * 100
 
-            # Choppy filter: skip if too many reversals in last 30 seconds
-            if recent_revs >= CONFIG["choppy_threshold"]:
-                w["skipped"] = True
-                tg(
-                    f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-                    f"📈 Move: {pct:+.3f}%\n"
-                    f"🌪 Reason: Too choppy ({recent_revs}/{CONFIG['choppy_threshold']} reversals in 30s)\n"
-                    f"⏱ {secs_left}s left"
-                )
-                log.info(f"Skipped {asset} {tf}m {dirn} - too choppy ({recent_revs} reversals in 30s)")
-                continue
+                    # If ask is in target range, enter
+                    if min_c <= ask_cents <= max_c:
+                        log.info(f"ENTER {asset} {tf}m {dirn} - ask={ask_cents:.1f}¢ (no filters)")
+                        enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left,
+                                          open_time, close_time, ask_price, ask_cents)
+                        break  # Only enter one direction per window
+                except Exception as e:
+                    log.warning(f"Order book check failed for {asset} {tf}m {dirn}: {e}")
+                    continue
 
-            # Log the reversal counts for entered trades (for tuning the choppy threshold)
-            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%")
-            enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs, recent_revs)
+
+def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, ask_price, ask_cents):
+    """Simplified entry - no filters, just record the signal."""
+    bet = CONFIG["bet_size"]
+    emoji = ASSET_EMOJI.get(asset, "")
+    arrow = "🔺" if dirn == "UP" else "🔻"
+    shares = round(bet / ask_price, 4)
+
+    w["traded"] = True
+    now = datetime.now(timezone.utc)
+    trade = {
+        "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
+        "direction": dirn, "pct_move": round(pct, 4),
+        "open_price": w["open_price"], "entry_price": price,
+        "real_entry_cents": round(ask_cents, 1),
+        "shares": shares, "cost": bet,
+        "order_id": "SIGNAL_ONLY",
+        "window_open": open_time.isoformat(),
+        "window_close": close_time.isoformat(),
+    }
+    db_id = db_insert_trade(trade)
+    w["trade_db_id"] = db_id
+    w["direction"] = dirn
+    active_directions[(asset, tf)] = dirn
+
+    # Build market URL
+    asset_short = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "DOGE": "doge", "BNB": "bnb"}.get(asset, asset.lower())
+    window_ts = int(open_time.timestamp())
+    market_url = f"https://polymarket.com/event/{asset_short}-updown-{tf}m-{window_ts}"
+
+    tg(
+        f"🚨 <b>SIGNAL · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+        f"📈 Move: {pct:+.3f}%\n"
+        f"⏱ {secs_left}s left\n"
+        f"💰 Polymarket ask: <b>{ask_cents:.1f}¢</b>\n"
+        f"📦 Would buy: {shares} shares\n"
+        f"💵 Cost: ${bet:.2f}\n\n"
+        f"<a href=\"{market_url}\">🔗 Trade on Polymarket</a>\n"
+        f"🕐 {est_str()}"
+    )
+
+
+def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs=0, recent_revs=0):
+    """Legacy function - kept for compatibility but no longer used in v3.7 simplified mode."""
+    pass
 
 
 def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs=0, recent_revs=0):
@@ -1236,18 +1241,17 @@ def main():
     chainlink_ok = start_chainlink_threads()
 
     tg(
-        f"🚀 <b>PolySniper LIVE v3.7</b>\n"
-        f"🎯 <b>EARLY ENTRY TEST</b>\n"
+        f"🚀 <b>PolySniper LIVE v3.8</b>\n"
+        f"🧪 <b>SIMPLIFIED TEST (NO FILTERS)</b>\n"
         f"📲 Signals-only mode\n\n"
         f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
-        f"⏱ 5min + 15min\n"
+        f"⏱ 5min (last 180s) + 15min (last 300s)\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
-        f"⏰ Entry window: {CONFIG['entry_min_seconds']}-{CONFIG['entry_window_seconds']}s before close\n"
         f"💲 Entry range: <b>{CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢</b>\n"
-        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n"
-        f"🌪 Choppy filter: {CONFIG['choppy_threshold']}+ reversals\n\n"
-        f"<i>Testing earlier entries at cheaper prices.</i>\n"
-        f"<i>You trade manually via market links.</i>\n\n"
+        f"🚫 NO move threshold, NO reversal filter, NO conviction check\n"
+        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n\n"
+        f"<i>Pure price-range test. Both UP and DOWN sides checked.</i>\n"
+        f"<i>Tracks natural win rate at 65-85¢ entries.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
