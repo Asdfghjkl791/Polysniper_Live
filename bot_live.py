@@ -58,13 +58,13 @@ ASSET_THRESHOLDS_15 = {
     "BNB":  float(os.environ.get("THRESHOLD_BNB_15", "0.25")),
 }
 
-MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "20"))
-MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "40"))
+MAX_REVERSALS_5  = int(os.environ.get("MAX_REVERSALS_5",  "30"))
+MAX_REVERSALS_15 = int(os.environ.get("MAX_REVERSALS_15", "60"))
 
 CONFIG = {
     "bet_size":             float(os.environ.get("BET_SIZE", "1.0")),
     "entry_window_seconds": int(os.environ.get("ENTRY_SECS", "180")),
-    "entry_min_seconds":    int(os.environ.get("ENTRY_MIN_SECS", "60")),
+    "entry_min_seconds":    int(os.environ.get("ENTRY_MIN_SECS", "30")),
     "retry_interval_secs":  int(os.environ.get("RETRY_INTERVAL", "5")),
     "momentum_checks":      int(os.environ.get("MOMENTUM_CHECKS", "1")),
     "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
@@ -72,7 +72,7 @@ CONFIG = {
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
     "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "65.0")),
     "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "85.0")),
-    "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "20")),
+    "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "25")),
 }
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡", "BNB": "🟨"}
@@ -908,11 +908,11 @@ def process_tick():
             if tf == 5:
                 # Per-asset weakening tolerance (in % points)
                 weakening_tolerance_map = {
-                    "BTC":  float(os.environ.get("WEAKENING_TOLERANCE_BTC",  "0.05")),
-                    "ETH":  float(os.environ.get("WEAKENING_TOLERANCE_ETH",  "0.025")),
-                    "SOL":  float(os.environ.get("WEAKENING_TOLERANCE_SOL",  "0.05")),
-                    "DOGE": float(os.environ.get("WEAKENING_TOLERANCE_DOGE", "0.05")),
-                    "BNB":  float(os.environ.get("WEAKENING_TOLERANCE_BNB",  "0.05")),
+                    "BTC":  float(os.environ.get("WEAKENING_TOLERANCE_BTC",  "0.08")),
+                    "ETH":  float(os.environ.get("WEAKENING_TOLERANCE_ETH",  "0.05")),
+                    "SOL":  float(os.environ.get("WEAKENING_TOLERANCE_SOL",  "0.08")),
+                    "DOGE": float(os.environ.get("WEAKENING_TOLERANCE_DOGE", "0.08")),
+                    "BNB":  float(os.environ.get("WEAKENING_TOLERANCE_BNB",  "0.08")),
                 }
                 weakening_tolerance = weakening_tolerance_map.get(asset, 0.05)
                 if len(hist) >= 30:
