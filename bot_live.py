@@ -1184,37 +1184,46 @@ def settle(w, asset, tf, close_price):
 
 
 def _settle_worker(d, asset, tf):
-    """Background worker that does the actual settlement with retries."""
-    # Retry fetching Polymarket outcome for up to 120 seconds
+    """Background worker that does the actual settlement with retries.
+    Polymarket Gamma API can be slow (5-30 min sometimes), so we retry a long time.
+    NEVER fall back to local Chainlink math - that math is unreliable due to
+    timing differences between our Chainlink WS snapshots and Polymarket's
+    actual settlement price. Better to mark UNVERIFIED than to report wrong outcome.
+    """
+    # Retry fetching Polymarket outcome for up to 30 minutes
     poly_outcome = None
-    max_retries = 24  # 24 attempts × 5 sec = 120 seconds max wait
-    retry_delay = 5
+    max_retries = 180  # 180 attempts × 10 sec = 30 minutes max wait
+    retry_delay = 10
 
     for attempt in range(max_retries):
         poly_outcome = fetch_polymarket_outcome(asset, tf, d["open_time"])
         if poly_outcome:
             break
         if attempt < max_retries - 1:
-            log.info(f"Outcome not ready for {asset} {tf}m, retrying in {retry_delay}s (attempt {attempt+1}/{max_retries})...")
+            if attempt % 6 == 0:  # Log every minute instead of every retry
+                log.info(f"Outcome not ready for {asset} {tf}m, retrying (attempt {attempt+1}/{max_retries})...")
             time.sleep(retry_delay)
 
     if poly_outcome:
         actual = poly_outcome
         source = "Polymarket"
     else:
-        # Fallback: use latest Chainlink price (same source Polymarket uses)
-        # NOT CryptoCompare/Coinbase/CoinGecko - those disagree with Chainlink
-        chainlink_close = get_chainlink_price(asset)
-        if chainlink_close:
-            close_pct = (chainlink_close - d["open_price"]) / d["open_price"] * 100
-            actual = "UP" if close_pct >= 0 else "DOWN"
-            source = f"Chainlink (Polymarket Gamma unavailable, close={chainlink_close:.2f})"
-            log.warning(f"Settled {asset} {tf}m using Chainlink fallback - Polymarket outcome never published via Gamma")
-        else:
-            # Chainlink also unavailable - mark as unverified, don't guess
-            actual = d["direction"]  # Assume bot was right (so this is logged as a win)
-            source = "UNVERIFIED (Chainlink unavailable)"
-            log.error(f"Settled {asset} {tf}m as UNVERIFIED - both Polymarket Gamma and Chainlink unavailable")
+        # Polymarket Gamma never returned outcome after 30 min - very unusual.
+        # Mark UNVERIFIED. Do NOT report a win/loss because we can't trust it.
+        log.error(f"Settled {asset} {tf}m UNVERIFIED - Polymarket Gamma never published outcome after 30min")
+        # Update DB but skip the Telegram message to avoid bad data
+        conn = sqlite3.connect("trades_live.db")
+        conn.execute("UPDATE trades SET result=?, profit_loss=0, balance_after=? WHERE id=?",
+                     ("UNVERIFIED", state["balance_usd"], d["trade_db_id"]))
+        conn.commit()
+        conn.close()
+        tg(
+            f"❓ <b>{ASSET_EMOJI.get(asset, '')} {asset} {tf}m · UNVERIFIED</b>\n\n"
+            f"Polymarket Gamma never returned outcome.\n"
+            f"Trade was placed; outcome unknown.\n"
+            f"Check Polymarket portfolio for real result."
+        )
+        return
 
     won = actual == d["direction"]
 
