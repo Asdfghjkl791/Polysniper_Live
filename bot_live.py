@@ -942,10 +942,10 @@ def process_tick():
                     tg(
                         f"🔍 <b>DEBUG · BTC 5m</b>\n"
                         f"Window: {window_ts}\n"
-                        f"UP tok: <code>{str(up_token)[:20]}...</code>\n"
                         f"UP: {debug_asks.get('UP', 'none')}\n"
-                        f"DOWN tok: <code>{str(down_token)[:20]}...</code>\n"
+                        f"UP tok: <code>{up_token}</code>\n"
                         f"DOWN: {debug_asks.get('DOWN', 'none')}\n"
+                        f"DOWN tok: <code>{down_token}</code>\n"
                         f"Target: {min_c:.0f}-{max_c:.0f}¢\n"
                         f"Secs left: {secs_left}"
                     )
