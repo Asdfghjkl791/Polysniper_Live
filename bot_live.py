@@ -889,11 +889,22 @@ def process_tick():
                         continue
                     if isinstance(book, dict):
                         asks = book.get("asks", [])
+                        bids = book.get("bids", [])
                     else:
                         asks = getattr(book, "asks", [])
+                        bids = getattr(book, "bids", [])
+
+                    # Get bid for debug comparison
+                    bid_str = "—"
+                    if bids:
+                        fb = bids[0]
+                        bp = float(fb.get("price", 0)) if isinstance(fb, dict) else float(getattr(fb, "price", 0))
+                        if bp > 0:
+                            bid_str = f"{bp*100:.1f}¢"
+
                     if not asks:
                         if asset == "BTC" and tf == 5:
-                            debug_asks[dirn] = "EMPTY"
+                            debug_asks[dirn] = f"EMPTY(bid={bid_str})"
                         continue
                     first_ask = asks[0]
                     if isinstance(first_ask, dict):
@@ -908,7 +919,7 @@ def process_tick():
 
                     # DEBUG: record what we see
                     if asset == "BTC" and tf == 5:
-                        debug_asks[dirn] = f"{ask_cents:.1f}¢"
+                        debug_asks[dirn] = f"ask={ask_cents:.1f}¢ bid={bid_str}"
 
                     # If ask is in target range, enter
                     if min_c <= ask_cents <= max_c:
@@ -931,8 +942,10 @@ def process_tick():
                     tg(
                         f"🔍 <b>DEBUG · BTC 5m</b>\n"
                         f"Window: {window_ts}\n"
-                        f"UP ask: {debug_asks.get('UP', 'none')}\n"
-                        f"DOWN ask: {debug_asks.get('DOWN', 'none')}\n"
+                        f"UP tok: <code>{str(up_token)[:20]}...</code>\n"
+                        f"UP: {debug_asks.get('UP', 'none')}\n"
+                        f"DOWN tok: <code>{str(down_token)[:20]}...</code>\n"
+                        f"DOWN: {debug_asks.get('DOWN', 'none')}\n"
                         f"Target: {min_c:.0f}-{max_c:.0f}¢\n"
                         f"Secs left: {secs_left}"
                     )
