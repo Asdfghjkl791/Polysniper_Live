@@ -869,21 +869,31 @@ def process_tick():
             # Check both UP and DOWN sides - whichever is in 65-85c range, take it
             condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
             if not up_token or not down_token:
+                # DEBUG: log when market lookup fails
+                if asset == "BTC" and tf == 5:
+                    log.warning(f"DEBUG: find_market_for_window returned None for BTC 5m at window {open_time}")
                 continue
 
             min_c = CONFIG["min_entry_cents"]
             max_c = CONFIG["max_entry_cents"]
 
+            # DEBUG: collect asks for BTC 5m and send to Telegram occasionally
+            debug_asks = {}
+
             for dirn, token_id in [("UP", up_token), ("DOWN", down_token)]:
                 try:
                     book = clob_client.get_order_book(token_id)
                     if not book:
+                        if asset == "BTC" and tf == 5:
+                            debug_asks[dirn] = "NO_BOOK"
                         continue
                     if isinstance(book, dict):
                         asks = book.get("asks", [])
                     else:
                         asks = getattr(book, "asks", [])
                     if not asks:
+                        if asset == "BTC" and tf == 5:
+                            debug_asks[dirn] = "EMPTY"
                         continue
                     first_ask = asks[0]
                     if isinstance(first_ask, dict):
@@ -891,8 +901,14 @@ def process_tick():
                     else:
                         ask_price = float(getattr(first_ask, "price", 0))
                     if ask_price <= 0:
+                        if asset == "BTC" and tf == 5:
+                            debug_asks[dirn] = f"INVALID({ask_price})"
                         continue
                     ask_cents = ask_price * 100
+
+                    # DEBUG: record what we see
+                    if asset == "BTC" and tf == 5:
+                        debug_asks[dirn] = f"{ask_cents:.1f}¢"
 
                     # If ask is in target range, enter
                     if min_c <= ask_cents <= max_c:
@@ -902,7 +918,24 @@ def process_tick():
                         break  # Only enter one direction per window
                 except Exception as e:
                     log.warning(f"Order book check failed for {asset} {tf}m {dirn}: {e}")
+                    if asset == "BTC" and tf == 5:
+                        debug_asks[dirn] = f"ERR:{str(e)[:30]}"
                     continue
+
+            # DEBUG: send Telegram message with asks once per minute for BTC 5m
+            if asset == "BTC" and tf == 5 and debug_asks:
+                now_ts = time.time()
+                if now_ts - state.get("last_debug_time", 0) > 60:
+                    state["last_debug_time"] = now_ts
+                    window_ts = int(open_time.timestamp())
+                    tg(
+                        f"🔍 <b>DEBUG · BTC 5m</b>\n"
+                        f"Window: {window_ts}\n"
+                        f"UP ask: {debug_asks.get('UP', 'none')}\n"
+                        f"DOWN ask: {debug_asks.get('DOWN', 'none')}\n"
+                        f"Target: {min_c:.0f}-{max_c:.0f}¢\n"
+                        f"Secs left: {secs_left}"
+                    )
 
 
 def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, ask_price, ask_cents):
