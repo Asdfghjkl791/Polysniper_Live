@@ -851,13 +851,9 @@ def process_tick():
             if w["traded"] or w["skipped"]:
                 continue
 
-            # Entry window: 5m = last 180s (3 min), 15m = last 300s (5 min)
-            if tf == 5:
-                entry_window = int(os.environ.get("ENTRY_SECS", "180"))
-            else:
-                entry_window = int(os.environ.get("ENTRY_SECS_15", "300"))
-
-            if secs_left <= 0 or secs_left > entry_window:
+            # NO time window restriction - enter at any time during the window
+            # Original code checked secs_left bounds; now removed for full window coverage
+            if secs_left <= 0:
                 continue
             if state["paused"]:
                 continue
@@ -1241,17 +1237,17 @@ def main():
     chainlink_ok = start_chainlink_threads()
 
     tg(
-        f"🚀 <b>PolySniper LIVE v3.8</b>\n"
-        f"🧪 <b>SIMPLIFIED TEST (NO FILTERS)</b>\n"
+        f"🚀 <b>PolySniper LIVE v3.9</b>\n"
+        f"🧪 <b>PURE PRICE TEST (NO FILTERS, NO TIMING)</b>\n"
         f"📲 Signals-only mode\n\n"
         f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
-        f"⏱ 5min (last 180s) + 15min (last 300s)\n"
+        f"⏱ 5min + 15min (anytime in window)\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
         f"💲 Entry range: <b>{CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢</b>\n"
-        f"🚫 NO move threshold, NO reversal filter, NO conviction check\n"
+        f"🚫 NO move threshold, NO filters, NO timing constraint\n"
         f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n\n"
-        f"<i>Pure price-range test. Both UP and DOWN sides checked.</i>\n"
-        f"<i>Tracks natural win rate at 65-85¢ entries.</i>\n\n"
+        f"<i>Pure price-only test. Both sides checked constantly.</i>\n"
+        f"<i>Enters first 65-85¢ ask it finds per window.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
