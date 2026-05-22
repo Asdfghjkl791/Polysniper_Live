@@ -882,35 +882,26 @@ def process_tick():
 
             for dirn, token_id in [("UP", up_token), ("DOWN", down_token)]:
                 try:
-                    book = clob_client.get_order_book(token_id)
-                    if not book:
-                        if asset == "BTC" and tf == 5:
-                            debug_asks[dirn] = "NO_BOOK"
-                        continue
-                    if isinstance(book, dict):
-                        asks = book.get("asks", [])
-                        bids = book.get("bids", [])
+                    # USE get_price() not get_order_book() - the book endpoint
+                    # returns stale "ghost" data (always 0.99/0.01). get_price gives
+                    # the actual live price. (Known bug in py-clob-client #180)
+                    # side="SELL" gives us the best ASK (what we'd pay to BUY)
+                    price_resp = clob_client.get_price(token_id, side="SELL")
+                    if isinstance(price_resp, dict):
+                        ask_price = float(price_resp.get("price", 0))
                     else:
-                        asks = getattr(book, "asks", [])
-                        bids = getattr(book, "bids", [])
+                        ask_price = float(price_resp)
 
-                    # Get bid for debug comparison
+                    # Also fetch midpoint and BUY-side price for debug
                     bid_str = "—"
-                    if bids:
-                        fb = bids[0]
-                        bp = float(fb.get("price", 0)) if isinstance(fb, dict) else float(getattr(fb, "price", 0))
-                        if bp > 0:
-                            bid_str = f"{bp*100:.1f}¢"
+                    try:
+                        mid_resp = clob_client.get_midpoint(token_id)
+                        mid_price = float(mid_resp.get("mid", 0)) if isinstance(mid_resp, dict) else float(mid_resp)
+                        if mid_price > 0:
+                            bid_str = f"mid={mid_price*100:.1f}¢"
+                    except Exception:
+                        pass
 
-                    if not asks:
-                        if asset == "BTC" and tf == 5:
-                            debug_asks[dirn] = f"EMPTY(bid={bid_str})"
-                        continue
-                    first_ask = asks[0]
-                    if isinstance(first_ask, dict):
-                        ask_price = float(first_ask.get("price", 0))
-                    else:
-                        ask_price = float(getattr(first_ask, "price", 0))
                     if ask_price <= 0:
                         if asset == "BTC" and tf == 5:
                             debug_asks[dirn] = f"INVALID({ask_price})"
@@ -919,7 +910,7 @@ def process_tick():
 
                     # DEBUG: record what we see
                     if asset == "BTC" and tf == 5:
-                        debug_asks[dirn] = f"ask={ask_cents:.1f}¢ bid={bid_str}"
+                        debug_asks[dirn] = f"ask={ask_cents:.1f}¢ {bid_str}"
 
                     # If ask is in target range, enter
                     if min_c <= ask_cents <= max_c:
@@ -928,7 +919,7 @@ def process_tick():
                                           open_time, close_time, ask_price, ask_cents)
                         break  # Only enter one direction per window
                 except Exception as e:
-                    log.warning(f"Order book check failed for {asset} {tf}m {dirn}: {e}")
+                    log.warning(f"Price check failed for {asset} {tf}m {dirn}: {e}")
                     if asset == "BTC" and tf == 5:
                         debug_asks[dirn] = f"ERR:{str(e)[:30]}"
                     continue
