@@ -969,10 +969,19 @@ def process_tick():
             if w["traded"] or w["skipped"]:
                 continue
 
-            # NO time window restriction - enter at any time during the window
-            # Original code checked secs_left bounds; now removed for full window coverage
+            # Skip too-early entries: wait for the move to establish itself.
+            # 5m markets: skip first 60s
+            # 15m markets: skip first 180s
             if secs_left <= 0:
                 continue
+            if tf == 5:
+                early_skip = int(os.environ.get("EARLY_SKIP_5", "60"))
+                if secs_left > (300 - early_skip):
+                    continue
+            else:  # 15m
+                early_skip = int(os.environ.get("EARLY_SKIP_15", "180"))
+                if secs_left > (900 - early_skip):
+                    continue
             if state["paused"]:
                 continue
             if state["balance_usd"] < CONFIG["min_balance"]:
@@ -1428,6 +1437,21 @@ def process_lag_signals():
             # Don't fire in the last 10 seconds (window about to settle)
             if secs_left < 10:
                 continue
+
+            # Don't fire too EARLY in the window either.
+            # 5m markets: skip first 60s (wait for real trend, secs_left must be < 240)
+            # 15m markets: skip first 180s (wait for sustained move, secs_left must be < 720)
+            # The early part of windows is just noise; lag signals there are unreliable.
+            if tf == 5:
+                early_skip = int(os.environ.get("EARLY_SKIP_5", "60"))
+                window_total = 300
+                if secs_left > (window_total - early_skip):
+                    continue
+            else:  # 15m
+                early_skip = int(os.environ.get("EARLY_SKIP_15", "180"))
+                window_total = 900
+                if secs_left > (window_total - early_skip):
+                    continue
 
             # Check Polymarket order book for this direction
             condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
