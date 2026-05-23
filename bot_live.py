@@ -568,6 +568,124 @@ def get_chainlink_price(asset):
     return prices_chainlink[asset]
 
 
+# ─── COINBASE WEBSOCKET (For lag detection vs Chainlink) ─────────────────────
+# Strategy: Coinbase updates spot prices in real-time. Chainlink has its own
+# update interval (lags by a few seconds). When Coinbase shows BTC moved up
+# significantly but Chainlink hasn't updated yet, we know Chainlink will tick up
+# soon. We enter BEFORE Chainlink/Polymarket catches up.
+#
+# Per research: This is how the most successful Polymarket bots work
+# (e.g. 0x8dxd turned $313 -> $438K with ~98% win rate using this approach).
+COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+COINBASE_PRODUCTS_MAP = {
+    "BTC":  "BTC-USD",
+    "ETH":  "ETH-USD",
+    "SOL":  "SOL-USD",
+    "DOGE": "DOGE-USD",
+    "BNB":  None,  # Coinbase doesn't list BNB
+}
+prices_coinbase = {}
+coinbase_last_update = {}
+
+
+def coinbase_websocket_worker():
+    """
+    Single thread that subscribes to Coinbase ticker feed for all supported assets.
+    Coinbase pushes real-time ticker updates. We just listen and update the dict.
+    """
+    products = [p for p in COINBASE_PRODUCTS_MAP.values() if p]
+    if not products:
+        return
+
+    while True:
+        ws = None
+        try:
+            log.info(f"[Coinbase WS] Connecting for {products}...")
+            ws = websocket.create_connection(COINBASE_WS_URL, timeout=10)
+            ws.settimeout(30)
+            subscribe_msg = {
+                "type": "subscribe",
+                "product_ids": products,
+                "channels": ["ticker"],
+            }
+            ws.send(json.dumps(subscribe_msg))
+            log.info(f"[Coinbase WS] Subscribed to ticker for {products}")
+
+            # Reverse map: "BTC-USD" -> "BTC"
+            product_to_asset = {v: k for k, v in COINBASE_PRODUCTS_MAP.items() if v}
+
+            while True:
+                try:
+                    msg = ws.recv()
+                    if not msg:
+                        continue
+                    data = json.loads(msg)
+                    if data.get("type") != "ticker":
+                        continue
+                    product_id = data.get("product_id")
+                    asset = product_to_asset.get(product_id)
+                    if not asset:
+                        continue
+                    price = float(data.get("price", 0))
+                    if price > 0:
+                        prices_coinbase[asset] = price
+                        coinbase_last_update[asset] = time.time()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception as e:
+                    log.warning(f"[Coinbase WS] recv error: {e}")
+                    break
+        except Exception as e:
+            log.error(f"[Coinbase WS] connection error: {e}")
+        finally:
+            try:
+                if ws:
+                    ws.close()
+            except:
+                pass
+        time.sleep(3)  # Wait before reconnecting
+
+
+def start_coinbase_thread():
+    """Start the single Coinbase WS thread."""
+    if not WEBSOCKET_AVAILABLE:
+        return False
+    t = threading.Thread(target=coinbase_websocket_worker, daemon=True)
+    t.start()
+    log.info("[Coinbase WS] Background thread started")
+    return True
+
+
+def get_coinbase_price(asset):
+    """Returns latest Coinbase price, or None if stale (>10s)."""
+    if asset not in prices_coinbase:
+        return None
+    last_update = coinbase_last_update.get(asset, 0)
+    if time.time() - last_update > 10:
+        return None
+    return prices_coinbase[asset]
+
+
+def detect_price_lag(asset, lag_threshold_pct=0.05):
+    """
+    Compare Coinbase real-time price to Chainlink price.
+    Returns a tuple (direction, lag_pct) when there's meaningful lag:
+        ("UP", lag_pct)  if Coinbase > Chainlink by lag_threshold_pct
+        ("DOWN", lag_pct) if Coinbase < Chainlink by lag_threshold_pct
+        (None, 0) if no lag detected or data unavailable
+
+    lag_threshold_pct is in % points (e.g. 0.05 = 0.05% = 5bps)
+    """
+    chainlink = get_chainlink_price(asset)
+    coinbase = get_coinbase_price(asset)
+    if not chainlink or not coinbase:
+        return None, 0
+    lag_pct = (coinbase - chainlink) / chainlink * 100
+    if abs(lag_pct) < lag_threshold_pct:
+        return None, lag_pct
+    return ("UP" if lag_pct > 0 else "DOWN"), lag_pct
+
+
 def fetch_validated_prices():
     """
     CHAINLINK-ONLY MODE: Returns prices from Polymarket's Chainlink WebSocket feed ONLY.
@@ -1274,6 +1392,125 @@ def _settle_worker(d, asset, tf):
     #     tg(f"⏸ <b>Auto-paused after loss</b>\n/resume when ready.")
 
 
+# ─── LAG DETECTION TRADING ──────────────────────────────────────────────────
+# Tracks last-fired window per asset to avoid double-firing on the same window
+lag_fired_windows = {}  # {(asset, tf, window_key): timestamp}
+
+
+def process_lag_signals():
+    """
+    Detects when Coinbase shows price movement that Chainlink hasn't caught up to.
+    Fires a signal in the matching direction.
+
+    Currently configured for BTC only (highest liquidity, cleanest detection).
+    """
+    LAG_ASSETS = os.environ.get("LAG_ASSETS", "BTC").split(",")
+    lag_threshold = float(os.environ.get("LAG_THRESHOLD_PCT", "0.05"))
+
+    for asset in LAG_ASSETS:
+        asset = asset.strip()
+        if asset not in ASSET_LIST:
+            continue
+
+        direction, lag_pct = detect_price_lag(asset, lag_threshold)
+        if direction is None:
+            continue
+
+        # Lag detected - try to enter both 5m and 15m markets
+        for tf in TIMEFRAMES:
+            open_time, close_time, secs_left = get_window_times(tf)
+            window_key = (asset, tf, wkey(asset, tf, open_time))
+
+            # Don't fire if we already fired for this window
+            if window_key in lag_fired_windows:
+                continue
+
+            # Don't fire in the last 10 seconds (window about to settle)
+            if secs_left < 10:
+                continue
+
+            # Check Polymarket order book for this direction
+            condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
+            if not up_token or not down_token:
+                continue
+
+            token_id = up_token if direction == "UP" else down_token
+
+            try:
+                # Use get_price (not get_order_book - that's broken in SDK)
+                price_resp = clob_client.get_price(token_id, side="SELL")
+                if isinstance(price_resp, dict):
+                    ask_price = float(price_resp.get("price", 0))
+                else:
+                    ask_price = float(price_resp)
+                if ask_price <= 0:
+                    continue
+                ask_cents = ask_price * 100
+            except Exception as e:
+                log.warning(f"Lag price check failed for {asset} {tf}m {direction}: {e}")
+                continue
+
+            # Only enter if price hasn't already spiked to 99¢
+            min_c = float(os.environ.get("LAG_MIN_CENTS", "30"))
+            max_c = float(os.environ.get("LAG_MAX_CENTS", "85"))
+            if ask_cents < min_c or ask_cents > max_c:
+                continue
+
+            lag_fired_windows[window_key] = time.time()
+
+            # Record signal in DB
+            bet = CONFIG["bet_size"]
+            shares = round(bet / ask_price, 4)
+            now = datetime.now(timezone.utc)
+            trade = {
+                "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
+                "direction": direction, "pct_move": round(lag_pct, 4),
+                "open_price": get_chainlink_price(asset),
+                "entry_price": get_coinbase_price(asset),
+                "real_entry_cents": round(ask_cents, 1),
+                "shares": shares, "cost": bet,
+                "order_id": "LAG_SIGNAL",
+                "window_open": open_time.isoformat(),
+                "window_close": close_time.isoformat(),
+            }
+            db_id = db_insert_trade(trade)
+
+            # Set up window tracking for settlement
+            ws_key = (asset, tf)
+            if ws_key in windows:
+                windows[ws_key]["traded"] = True
+                windows[ws_key]["trade_db_id"] = db_id
+                windows[ws_key]["direction"] = direction
+
+            asset_short = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "DOGE": "doge", "BNB": "bnb"}.get(asset, asset.lower())
+            window_ts = int(open_time.timestamp())
+            market_url = f"https://polymarket.com/event/{asset_short}-updown-{tf}m-{window_ts}"
+
+            emoji = ASSET_EMOJI.get(asset, "")
+            arrow = "🔺" if direction == "UP" else "🔻"
+            cb_price = get_coinbase_price(asset)
+            cl_price = get_chainlink_price(asset)
+
+            tg(
+                f"⚡ <b>LAG SIGNAL · {emoji} {asset} · {tf}m · {direction}</b> {arrow}\n\n"
+                f"🪙 Coinbase: ${cb_price:.2f}\n"
+                f"🔗 Chainlink: ${cl_price:.2f}\n"
+                f"📊 Lag: {lag_pct:+.3f}%\n"
+                f"⏱ {secs_left}s left\n"
+                f"💰 Polymarket ask: <b>{ask_cents:.1f}¢</b>\n"
+                f"📦 Would buy: {shares} shares\n"
+                f"💵 Cost: ${bet:.2f}\n\n"
+                f"<a href=\"{market_url}\">🔗 Trade on Polymarket</a>\n"
+                f"🕐 {est_str()}"
+            )
+
+    # Cleanup old fired windows (older than 30 min)
+    now_ts = time.time()
+    expired = [k for k, t in lag_fired_windows.items() if now_ts - t > 1800]
+    for k in expired:
+        del lag_fired_windows[k]
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
     global prices, last_prices_time
@@ -1282,18 +1519,21 @@ def main():
     # Start Chainlink WebSocket background threads for accurate settlement-matching prices
     chainlink_ok = start_chainlink_threads()
 
+    # Start Coinbase WebSocket for real-time spot prices (lag detection)
+    coinbase_ok = start_coinbase_thread()
+
     tg(
-        f"🚀 <b>PolySniper LIVE v3.9</b>\n"
-        f"🧪 <b>PURE PRICE TEST (NO FILTERS, NO TIMING)</b>\n"
-        f"📲 Signals-only mode\n\n"
-        f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
-        f"⏱ 5min + 15min (anytime in window)\n"
+        f"🚀 <b>PolySniper LIVE v4.0-LAG</b>\n"
+        f"🧪 <b>LAG DETECTION (Coinbase vs Chainlink)</b>\n"
+        f"📲 Signals-only mode · BTC only\n\n"
+        f"🎯 Strategy: enter when Coinbase spot price has moved\n"
+        f"   but Chainlink/Polymarket hasn't caught up yet.\n\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
-        f"💲 Entry range: <b>{CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢</b>\n"
-        f"🚫 NO move threshold, NO filters, NO timing constraint\n"
-        f"🔗 Chainlink WS: {'✅ Active' if chainlink_ok else '❌ DISABLED'}\n\n"
-        f"<i>Pure price-only test. Both sides checked constantly.</i>\n"
-        f"<i>Enters first 65-85¢ ask it finds per window.</i>\n\n"
+        f"💲 Entry range: {CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢\n"
+        f"🔗 Chainlink WS: {'✅' if chainlink_ok else '❌'}\n"
+        f"🪙 Coinbase WS: {'✅' if coinbase_ok else '❌'}\n\n"
+        f"<i>Lag threshold: 0.05% (configurable via LAG_THRESHOLD_PCT)</i>\n"
+        f"<i>Old price-only test still runs in parallel.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
@@ -1338,6 +1578,7 @@ def main():
             handle_commands()
             if prices and not state["paused"]:
                 process_tick()
+                process_lag_signals()
 
             # Periodic balance refresh
             if now - state["last_balance_check"] > 300:
