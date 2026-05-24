@@ -208,7 +208,7 @@ def db_stats():
     c = conn.cursor()
     c.execute("""
         SELECT COUNT(*), SUM(CASE WHEN result='WON' THEN 1 ELSE 0 END), SUM(profit_loss)
-        FROM trades WHERE result IN ('WON','LOST')
+        FROM trades WHERE result IN ('WON','LOST','STOPPED')
     """)
     r = c.fetchone()
     conn.close()
@@ -553,6 +553,93 @@ def start_chainlink_threads():
         t.start()
     log.info(f"[Chainlink WS] Started {len(ASSET_LIST)} background threads")
     return True
+
+
+# ─── SIMULATED STOP LOSS (PAPER TRADING) ────────────────────────────────────
+# This bot simulates a stop-loss: if a position's value drops below threshold,
+# we record a partial loss instead of waiting for window close.
+# v3.8-SL purpose: test if stop-loss IMPROVES or HURTS win rate vs base v3.8.
+STOP_LOSS_DROP_CENTS = float(os.environ.get("STOP_LOSS_DROP_CENTS", "40"))
+STOP_LOSS_CHECK_SECS = int(os.environ.get("STOP_LOSS_CHECK_SECS", "15"))
+STOP_LOSS_MIN_SECS_LEFT = int(os.environ.get("STOP_LOSS_MIN_SECS_LEFT", "30"))
+
+# Dict of open paper positions for stop-loss monitoring.
+# Format: {trade_db_id: {token_id, shares, entry_cents, asset, tf, direction, close_time, stopped}}
+open_paper_positions = {}
+
+
+def stop_loss_simulator():
+    """Background thread that checks each open paper position's current price.
+    If price drops below entry by STOP_LOSS_DROP_CENTS, mark as stopped (partial loss).
+    """
+    while True:
+        try:
+            time.sleep(STOP_LOSS_CHECK_SECS)
+            if not open_paper_positions:
+                continue
+            if not clob_client:
+                continue
+
+            for db_id, pos in list(open_paper_positions.items()):
+                if pos.get("stopped"):
+                    continue
+
+                # Don't stop in the last N seconds (let it ride to close)
+                secs_to_close = (pos["close_time"] - datetime.now(timezone.utc)).total_seconds()
+                if secs_to_close < STOP_LOSS_MIN_SECS_LEFT:
+                    continue
+
+                # Check current ask price (what we could sell at)
+                try:
+                    price_resp = clob_client.get_price(pos["token_id"], side="BUY")
+                    if isinstance(price_resp, dict):
+                        current_bid = float(price_resp.get("price", 0))
+                    else:
+                        current_bid = float(price_resp)
+                    if current_bid <= 0:
+                        continue
+                    current_cents = current_bid * 100
+                except Exception as e:
+                    continue
+
+                # Has price dropped enough to trigger stop loss?
+                drop_cents = pos["entry_cents"] - current_cents
+                if drop_cents < STOP_LOSS_DROP_CENTS:
+                    continue
+
+                # STOP LOSS TRIGGERED - simulate selling at current bid
+                pos["stopped"] = True
+                proceeds = pos["shares"] * current_bid  # what we'd get from selling
+                loss = pos["cost"] - proceeds  # actual paper loss (less than full $1)
+
+                conn = sqlite3.connect("trades_live.db")
+                conn.execute("""
+                    UPDATE trades SET result=?, profit_loss=?, close_price=?, payout=?, balance_after=?
+                    WHERE id=?
+                """, ("STOPPED", -loss, current_bid, proceeds, state["balance_usd"], db_id))
+                conn.commit()
+                conn.close()
+
+                # Remove from monitoring (window will skip its settlement now)
+                # NOTE: keep the entry in the dict so settle() can see it was stopped
+                emoji = ASSET_EMOJI.get(pos["asset"], "")
+                tg(
+                    f"🛑 <b>STOP LOSS · {emoji} {pos['asset']} {pos['tf']}m · {pos['direction']}</b>\n\n"
+                    f"Entry: {pos['entry_cents']:.1f}¢ → Stopped: {current_cents:.1f}¢\n"
+                    f"Drop: {drop_cents:.1f}¢\n"
+                    f"Paper loss: ${loss:.3f} (vs ${pos['cost']:.2f} max)\n"
+                    f"🕐 {est_str()}"
+                )
+                log.info(f"STOP LOSS {pos['asset']} {pos['tf']}m: entry={pos['entry_cents']:.1f}¢ stop={current_cents:.1f}¢ loss=${loss:.3f}")
+
+        except Exception as e:
+            log.error(f"Stop loss simulator error: {e}")
+
+
+def start_stop_loss_thread():
+    t = threading.Thread(target=stop_loss_simulator, daemon=True)
+    t.start()
+    log.info(f"Stop-loss simulator started (drop threshold {STOP_LOSS_DROP_CENTS}¢)")
 
 
 def get_chainlink_price(asset):
@@ -1093,6 +1180,22 @@ def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, clo
     w["direction"] = dirn
     active_directions[(asset, tf)] = dirn
 
+    # Track for stop-loss monitoring
+    condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
+    if up_token and down_token:
+        token_id = up_token if dirn == "UP" else down_token
+        open_paper_positions[db_id] = {
+            "token_id": token_id,
+            "shares": shares,
+            "entry_cents": ask_cents,
+            "cost": bet,
+            "asset": asset,
+            "tf": tf,
+            "direction": dirn,
+            "close_time": close_time,
+            "stopped": False,
+        }
+
     # Build market URL
     asset_short = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "DOGE": "doge", "BNB": "bnb"}.get(asset, asset.lower())
     window_ts = int(open_time.timestamp())
@@ -1317,6 +1420,15 @@ def _settle_worker(d, asset, tf):
     timing differences between our Chainlink WS snapshots and Polymarket's
     actual settlement price. Better to mark UNVERIFIED than to report wrong outcome.
     """
+    # If this trade was already stopped out, skip settlement entirely
+    if d["trade_db_id"] in open_paper_positions:
+        if open_paper_positions[d["trade_db_id"]].get("stopped"):
+            log.info(f"Skipping settlement for {asset} {tf}m - already stopped out")
+            del open_paper_positions[d["trade_db_id"]]
+            return
+        # Remove from tracking now that window closed
+        del open_paper_positions[d["trade_db_id"]]
+
     # Retry fetching Polymarket outcome for up to 30 minutes
     poly_outcome = None
     max_retries = 180  # 180 attempts × 10 sec = 30 minutes max wait
@@ -1546,18 +1658,22 @@ def main():
     # Start Coinbase WebSocket for real-time spot prices (lag detection)
     coinbase_ok = start_coinbase_thread()
 
+    # Start stop-loss simulator thread
+    start_stop_loss_thread()
+
     tg(
-        f"🚀 <b>PolySniper LIVE v4.0-LAG</b>\n"
-        f"🧪 <b>LAG DETECTION (Coinbase vs Chainlink)</b>\n"
-        f"📲 Signals-only mode · BTC only\n\n"
-        f"🎯 Strategy: enter when Coinbase spot price has moved\n"
-        f"   but Chainlink/Polymarket hasn't caught up yet.\n\n"
+        f"🚀 <b>PolySniper LIVE v3.8-SL</b>\n"
+        f"🧪 <b>WITH SIMULATED STOP LOSS</b>\n"
+        f"📲 Signals-only paper trading\n\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
         f"💲 Entry range: {CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢\n"
+        f"🛑 Stop-loss: -{STOP_LOSS_DROP_CENTS:.0f}¢ from entry\n"
+        f"⏱ Check every: {STOP_LOSS_CHECK_SECS}s\n"
+        f"⏳ Min secs left for stop: {STOP_LOSS_MIN_SECS_LEFT}\n"
         f"🔗 Chainlink WS: {'✅' if chainlink_ok else '❌'}\n"
         f"🪙 Coinbase WS: {'✅' if coinbase_ok else '❌'}\n\n"
-        f"<i>Lag threshold: 0.05% (configurable via LAG_THRESHOLD_PCT)</i>\n"
-        f"<i>Old price-only test still runs in parallel.</i>\n\n"
+        f"<i>Test: does stop-loss IMPROVE or HURT vs base v3.8?</i>\n"
+        f"<i>Compare PnL after 500+ trades.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
