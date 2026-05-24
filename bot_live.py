@@ -584,8 +584,20 @@ def stop_loss_simulator():
                 if pos.get("stopped"):
                     continue
 
-                # Don't stop in the last N seconds (let it ride to close)
+                # Only trigger stop-loss late in the window:
+                # 5m markets: only last 2 min (secs_to_close < 120)
+                # 15m markets: only last 4 min (secs_to_close < 240)
+                # Early-window dips usually recover, so don't stop those.
                 secs_to_close = (pos["close_time"] - datetime.now(timezone.utc)).total_seconds()
+                tf = pos["tf"]
+                if tf == 5:
+                    sl_active_threshold = int(os.environ.get("SL_ACTIVE_5", "120"))
+                else:  # 15m
+                    sl_active_threshold = int(os.environ.get("SL_ACTIVE_15", "240"))
+                if secs_to_close > sl_active_threshold:
+                    continue  # Too early in window, let it ride
+
+                # Don't stop in the very last N seconds (let it ride to close)
                 if secs_to_close < STOP_LOSS_MIN_SECS_LEFT:
                     continue
 
