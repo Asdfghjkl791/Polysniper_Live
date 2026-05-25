@@ -973,8 +973,8 @@ def process_tick():
             # 5m: need at least 40s left, 15m: need at least 60s left.
             if secs_left <= 0:
                 continue
-            min_secs_5 = int(os.environ.get("MIN_SECS_5", "40"))
-            min_secs_15 = int(os.environ.get("MIN_SECS_15", "60"))
+            min_secs_5 = int(os.environ.get("MIN_SECS_5", "90"))
+            min_secs_15 = int(os.environ.get("MIN_SECS_15", "120"))
             if tf == 5 and secs_left < min_secs_5:
                 continue
             if tf == 15 and secs_left < min_secs_15:
@@ -995,6 +995,49 @@ def process_tick():
             hist = price_histories[ws_key]
             recent_revs = count_reversals_recent(hist, seconds=30)
             total_revs = count_reversals(hist)
+
+            # ─── SUDDEN SPIKE FILTER ─────────────────────────────────────
+            # If the price moved >0.10% in the LAST 15 SECONDS, it's a spike.
+            # Spikes often retrace (good for contrarian).
+            # Gradual drifts over the full window are real trends (bad for contrarian).
+            # Require the move to have been recent for contrarian to make sense.
+            spike_threshold_pct = float(os.environ.get("SPIKE_THRESHOLD_PCT", "0.10"))
+            require_spike = os.environ.get("REQUIRE_SPIKE", "true").lower() == "true"
+            is_spike = False
+            spike_pct = 0.0
+            if len(hist) >= 15:
+                price_15s_ago = list(hist)[-15]
+                spike_pct = (price - price_15s_ago) / price_15s_ago * 100
+                if abs(spike_pct) >= spike_threshold_pct:
+                    is_spike = True
+            if require_spike and not is_spike:
+                continue  # Not a spike, skip contrarian entry
+
+            # ─── COINBASE REVERSAL DETECTION ─────────────────────────────
+            # For contrarian to work, we want Coinbase to be showing the price
+            # ALREADY REVERSING. Compare Coinbase NOW vs Coinbase 5 seconds ago.
+            # If Coinbase shows reversal direction matching what we'd bet on (contrarian),
+            # that's a real reversal signal.
+            require_cb_reversal = os.environ.get("REQUIRE_CB_REVERSAL", "true").lower() == "true"
+            cb_reversal_threshold = float(os.environ.get("CB_REVERSAL_THRESHOLD_PCT", "0.02"))
+            cb_now = get_coinbase_price(asset)
+            cb_reversing_up = False    # Coinbase shows recent UP move
+            cb_reversing_down = False  # Coinbase shows recent DOWN move
+            cb_recent_move_pct = 0.0
+            if cb_now and ws_key in price_histories:
+                # Look at Coinbase price 5 ticks ago vs now
+                cb_history = state.get(f"cb_hist_{asset}", [])
+                cb_history.append(cb_now)
+                if len(cb_history) > 30:
+                    cb_history = cb_history[-30:]
+                state[f"cb_hist_{asset}"] = cb_history
+                if len(cb_history) >= 5:
+                    cb_5s_ago = cb_history[-5]
+                    cb_recent_move_pct = (cb_now - cb_5s_ago) / cb_5s_ago * 100
+                    if cb_recent_move_pct >= cb_reversal_threshold:
+                        cb_reversing_up = True
+                    elif cb_recent_move_pct <= -cb_reversal_threshold:
+                        cb_reversing_down = True
 
             # Check both UP and DOWN sides - whichever is in 1-3¢ range, take it
             condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
@@ -1042,12 +1085,26 @@ def process_tick():
                     if asset == "BTC" and tf == 5:
                         debug_asks[dirn] = f"ask={ask_cents:.1f}¢ {bid_str}"
 
-                    # If ask is in target range, enter
+                    # If ask is in target range, also require Coinbase reversal direction match
                     if min_c <= ask_cents <= max_c:
-                        log.info(f"ENTER {asset} {tf}m {dirn} - ask={ask_cents:.1f}¢ move={absp:.3f}% revs30s={recent_revs} total_revs={total_revs}")
+                        # For contrarian to make sense: if we want to buy UP at 2¢
+                        # (market thinks DOWN), Coinbase should be showing UP reversal now.
+                        # If we want to buy DOWN at 2¢ (market thinks UP), Coinbase should
+                        # be showing DOWN reversal.
+                        cb_confirms = False
+                        if dirn == "UP" and cb_reversing_up:
+                            cb_confirms = True
+                        elif dirn == "DOWN" and cb_reversing_down:
+                            cb_confirms = True
+
+                        if require_cb_reversal and not cb_confirms:
+                            log.info(f"SKIP {asset} {tf}m {dirn} @{ask_cents:.1f}¢ - no Coinbase reversal confirm (cb_move={cb_recent_move_pct:+.3f}%)")
+                            continue
+
+                        log.info(f"ENTER {asset} {tf}m {dirn} - ask={ask_cents:.1f}¢ move={absp:.3f}% spike={spike_pct:+.3f}% cb_move={cb_recent_move_pct:+.3f}% revs30s={recent_revs}")
                         enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left,
                                           open_time, close_time, ask_price, ask_cents,
-                                          recent_revs, total_revs)
+                                          recent_revs, total_revs, spike_pct, cb_recent_move_pct)
                         break  # Only enter one direction per window
                 except Exception as e:
                     log.warning(f"Price check failed for {asset} {tf}m {dirn}: {e}")
@@ -1073,9 +1130,9 @@ def process_tick():
                     )
 
 
-def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, ask_price, ask_cents, recent_revs=0, total_revs=0):
+def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, ask_price, ask_cents, recent_revs=0, total_revs=0, spike_pct=0.0, cb_move_pct=0.0):
     """Simplified entry - no filters, just record the signal.
-    For contrarian analysis: shows move% and reversal counts so we can learn patterns.
+    For contrarian analysis: shows move%, reversal counts, spike, Coinbase reversal data.
     """
     bet = CONFIG["bet_size"]
     emoji = ASSET_EMOJI.get(asset, "")
@@ -1108,7 +1165,9 @@ def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, clo
 
     tg(
         f"🎲 <b>CONTRARIAN · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-        f"📈 Move: {pct:+.3f}% (abs: {absp:.3f}%)\n"
+        f"📈 Window move: {pct:+.3f}% (abs: {absp:.3f}%)\n"
+        f"⚡ 15s spike: {spike_pct:+.3f}%\n"
+        f"🪙 Coinbase 5s: {cb_move_pct:+.3f}%\n"
         f"🔄 30s reversals: <b>{recent_revs}</b>\n"
         f"🔄 Window reversals: <b>{total_revs}</b>\n"
         f"⏱ {secs_left}s left\n"
