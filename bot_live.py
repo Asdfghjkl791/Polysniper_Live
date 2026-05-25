@@ -969,9 +969,15 @@ def process_tick():
             if w["traded"] or w["skipped"]:
                 continue
 
-            # Contrarian strategy: enter at any time during the window.
-            # Don't skip early entries - 1-3¢ prices can appear anytime.
+            # Contrarian strategy: don't enter in the last seconds (no time to reverse).
+            # 5m: need at least 40s left, 15m: need at least 60s left.
             if secs_left <= 0:
+                continue
+            min_secs_5 = int(os.environ.get("MIN_SECS_5", "40"))
+            min_secs_15 = int(os.environ.get("MIN_SECS_15", "60"))
+            if tf == 5 and secs_left < min_secs_5:
+                continue
+            if tf == 15 and secs_left < min_secs_15:
                 continue
             if state["paused"]:
                 continue
@@ -984,7 +990,22 @@ def process_tick():
                 continue
             w["last_retry_at"] = now_ts
 
-            # Check both UP and DOWN sides - whichever is in 65-85c range, take it
+            # Contrarian filters: only enter when conditions favor a reversal.
+            # 1. Move % should be LOW (market hasn't strongly committed to a direction)
+            # 2. Recent reversals should be HIGH (market is choppy, reversal likely)
+            absp = abs(pct)
+            hist = price_histories[ws_key]
+            recent_revs = count_reversals_recent(hist, seconds=30)
+
+            max_move = float(os.environ.get("CONTRARIAN_MAX_MOVE", "0.20"))
+            min_recent_revs = int(os.environ.get("CONTRARIAN_MIN_REVS", "10"))
+
+            if absp > max_move:
+                continue  # Too strong a trend, unlikely to reverse
+            if recent_revs < min_recent_revs:
+                continue  # Not choppy enough, reversal unlikely
+
+            # Check both UP and DOWN sides - whichever is in 1-3¢ range, take it
             condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
             if not up_token or not down_token:
                 # DEBUG: log when market lookup fails
