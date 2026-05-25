@@ -72,8 +72,8 @@ CONFIG = {
     "price_agreement_pct":  float(os.environ.get("PRICE_AGREEMENT_PCT", "0.20")),
     "price_interval_secs":  5,
     "min_balance":          float(os.environ.get("MIN_BALANCE", "1.0")),
-    "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "65.0")),
-    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "85.0")),
+    "min_entry_cents":      float(os.environ.get("MIN_ENTRY_CENTS", "1.0")),
+    "max_entry_cents":      float(os.environ.get("MAX_ENTRY_CENTS", "3.0")),
     "choppy_threshold":     int(os.environ.get("CHOPPY_THRESHOLD", "25")),
 }
 
@@ -969,19 +969,10 @@ def process_tick():
             if w["traded"] or w["skipped"]:
                 continue
 
-            # Skip too-early entries: wait for the move to establish itself.
-            # 5m markets: skip first 60s
-            # 15m markets: skip first 180s
+            # Contrarian strategy: enter at any time during the window.
+            # Don't skip early entries - 1-3¢ prices can appear anytime.
             if secs_left <= 0:
                 continue
-            if tf == 5:
-                early_skip = int(os.environ.get("EARLY_SKIP_5", "60"))
-                if secs_left > (300 - early_skip):
-                    continue
-            else:  # 15m
-                early_skip = int(os.environ.get("EARLY_SKIP_15", "180"))
-                if secs_left > (900 - early_skip):
-                    continue
             if state["paused"]:
                 continue
             if state["balance_usd"] < CONFIG["min_balance"]:
@@ -1547,17 +1538,19 @@ def main():
     coinbase_ok = start_coinbase_thread()
 
     tg(
-        f"🚀 <b>PolySniper LIVE v4.0-LAG</b>\n"
-        f"🧪 <b>LAG DETECTION (Coinbase vs Chainlink)</b>\n"
-        f"📲 Signals-only mode · BTC only\n\n"
-        f"🎯 Strategy: enter when Coinbase spot price has moved\n"
-        f"   but Chainlink/Polymarket hasn't caught up yet.\n\n"
+        f"🚀 <b>PolySniper LIVE v3.8-CONTRARIAN</b>\n"
+        f"🎲 <b>EXTREME LOSING SIDE STRATEGY</b>\n"
+        f"📲 Signals-only paper trading\n\n"
+        f"🎯 Buy the 1-3¢ side (heavily losing)\n"
+        f"   When it wins (rare), payoff is 30:1+\n\n"
         f"💵 Bet size: ${CONFIG['bet_size']}\n"
-        f"💲 Entry range: {CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢\n"
-        f"🔗 Chainlink WS: {'✅' if chainlink_ok else '❌'}\n"
-        f"🪙 Coinbase WS: {'✅' if coinbase_ok else '❌'}\n\n"
-        f"<i>Lag threshold: 0.05% (configurable via LAG_THRESHOLD_PCT)</i>\n"
-        f"<i>Old price-only test still runs in parallel.</i>\n\n"
+        f"💲 Entry range: {CONFIG['min_entry_cents']:.1f}-{CONFIG['max_entry_cents']:.1f}¢\n"
+        f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
+        f"⏱ 5m + 15m windows\n"
+        f"⏰ Enter at any time (no window filter)\n"
+        f"🔗 Chainlink WS: {'✅' if chainlink_ok else '❌'}\n\n"
+        f"<i>Need only 3-4% win rate to break even.</i>\n"
+        f"<i>5%+ would be very profitable.</i>\n\n"
         f"🕐 {est_full()}\n\n"
         f"Connecting to Polymarket..."
     )
@@ -1602,7 +1595,8 @@ def main():
             handle_commands()
             if prices and not state["paused"]:
                 process_tick()
-                process_lag_signals()
+                # Lag detection disabled for contrarian strategy
+                # process_lag_signals()
 
             # Periodic balance refresh
             if now - state["last_balance_check"] > 300:
