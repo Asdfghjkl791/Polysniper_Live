@@ -997,11 +997,13 @@ def process_tick():
             total_revs = count_reversals(hist)
 
             # ─── SUDDEN SPIKE FILTER ─────────────────────────────────────
-            # If the price moved >0.10% in the LAST 15 SECONDS, it's a spike.
+            # If the price moved >X% in the LAST 15 SECONDS, it's a spike.
             # Spikes often retrace (good for contrarian).
-            # Gradual drifts over the full window are real trends (bad for contrarian).
-            # Require the move to have been recent for contrarian to make sense.
-            spike_threshold_pct = float(os.environ.get("SPIKE_THRESHOLD_PCT", "0.10"))
+            # 5m markets have less dramatic moves, so use a smaller threshold.
+            if tf == 5:
+                spike_threshold_pct = float(os.environ.get("SPIKE_THRESHOLD_PCT_5", "0.05"))
+            else:
+                spike_threshold_pct = float(os.environ.get("SPIKE_THRESHOLD_PCT_15", "0.10"))
             require_spike = os.environ.get("REQUIRE_SPIKE", "true").lower() == "true"
             is_spike = False
             spike_pct = 0.0
@@ -1014,12 +1016,12 @@ def process_tick():
                 continue  # Not a spike, skip contrarian entry
 
             # ─── COINBASE REVERSAL DETECTION ─────────────────────────────
-            # For contrarian to work, we want Coinbase to be showing the price
-            # ALREADY REVERSING. Compare Coinbase NOW vs Coinbase 5 seconds ago.
-            # If Coinbase shows reversal direction matching what we'd bet on (contrarian),
-            # that's a real reversal signal.
+            # Per-timeframe threshold: 5m is more sensitive (smaller moves matter).
             require_cb_reversal = os.environ.get("REQUIRE_CB_REVERSAL", "true").lower() == "true"
-            cb_reversal_threshold = float(os.environ.get("CB_REVERSAL_THRESHOLD_PCT", "0.02"))
+            if tf == 5:
+                cb_reversal_threshold = float(os.environ.get("CB_REVERSAL_THRESHOLD_PCT_5", "0.015"))
+            else:
+                cb_reversal_threshold = float(os.environ.get("CB_REVERSAL_THRESHOLD_PCT_15", "0.02"))
             cb_now = get_coinbase_price(asset)
             cb_reversing_up = False    # Coinbase shows recent UP move
             cb_reversing_down = False  # Coinbase shows recent DOWN move
