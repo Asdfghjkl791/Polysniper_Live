@@ -990,20 +990,11 @@ def process_tick():
                 continue
             w["last_retry_at"] = now_ts
 
-            # Contrarian filters: only enter when conditions favor a reversal.
-            # 1. Move % should be LOW (market hasn't strongly committed to a direction)
-            # 2. Recent reversals should be HIGH (market is choppy, reversal likely)
+            # Compute move % and reversals for logging (no filter applied)
             absp = abs(pct)
             hist = price_histories[ws_key]
             recent_revs = count_reversals_recent(hist, seconds=30)
-
-            max_move = float(os.environ.get("CONTRARIAN_MAX_MOVE", "0.20"))
-            min_recent_revs = int(os.environ.get("CONTRARIAN_MIN_REVS", "10"))
-
-            if absp > max_move:
-                continue  # Too strong a trend, unlikely to reverse
-            if recent_revs < min_recent_revs:
-                continue  # Not choppy enough, reversal unlikely
+            total_revs = count_reversals(hist)
 
             # Check both UP and DOWN sides - whichever is in 1-3¢ range, take it
             condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
@@ -1053,9 +1044,10 @@ def process_tick():
 
                     # If ask is in target range, enter
                     if min_c <= ask_cents <= max_c:
-                        log.info(f"ENTER {asset} {tf}m {dirn} - ask={ask_cents:.1f}¢ (no filters)")
+                        log.info(f"ENTER {asset} {tf}m {dirn} - ask={ask_cents:.1f}¢ move={absp:.3f}% revs30s={recent_revs} total_revs={total_revs}")
                         enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left,
-                                          open_time, close_time, ask_price, ask_cents)
+                                          open_time, close_time, ask_price, ask_cents,
+                                          recent_revs, total_revs)
                         break  # Only enter one direction per window
                 except Exception as e:
                     log.warning(f"Price check failed for {asset} {tf}m {dirn}: {e}")
@@ -1081,12 +1073,16 @@ def process_tick():
                     )
 
 
-def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, ask_price, ask_cents):
-    """Simplified entry - no filters, just record the signal."""
+def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, ask_price, ask_cents, recent_revs=0, total_revs=0):
+    """Simplified entry - no filters, just record the signal.
+    For contrarian analysis: shows move% and reversal counts so we can learn patterns.
+    """
     bet = CONFIG["bet_size"]
     emoji = ASSET_EMOJI.get(asset, "")
     arrow = "🔺" if dirn == "UP" else "🔻"
     shares = round(bet / ask_price, 4)
+    absp = abs(pct)
+    max_payout = shares * 1.0  # if wins, payout = shares × $1
 
     w["traded"] = True
     now = datetime.now(timezone.utc)
@@ -1111,12 +1107,14 @@ def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, clo
     market_url = f"https://polymarket.com/event/{asset_short}-updown-{tf}m-{window_ts}"
 
     tg(
-        f"🚨 <b>SIGNAL · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-        f"📈 Move: {pct:+.3f}%\n"
+        f"🎲 <b>CONTRARIAN · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+        f"📈 Move: {pct:+.3f}% (abs: {absp:.3f}%)\n"
+        f"🔄 30s reversals: <b>{recent_revs}</b>\n"
+        f"🔄 Window reversals: <b>{total_revs}</b>\n"
         f"⏱ {secs_left}s left\n"
         f"💰 Polymarket ask: <b>{ask_cents:.1f}¢</b>\n"
         f"📦 Would buy: {shares} shares\n"
-        f"💵 Cost: ${bet:.2f}\n\n"
+        f"💵 Cost: ${bet:.2f} → Max win: ${max_payout:.2f}\n\n"
         f"<a href=\"{market_url}\">🔗 Trade on Polymarket</a>\n"
         f"🕐 {est_str()}"
     )
