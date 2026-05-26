@@ -1001,7 +1001,7 @@ def process_tick():
             # Spikes often retrace (good for contrarian).
             # 5m markets have less dramatic moves, so use a smaller threshold.
             if tf == 5:
-                spike_threshold_pct = float(os.environ.get("SPIKE_THRESHOLD_PCT_5", "0.05"))
+                spike_threshold_pct = float(os.environ.get("SPIKE_THRESHOLD_PCT_5", "0.03"))
             else:
                 spike_threshold_pct = float(os.environ.get("SPIKE_THRESHOLD_PCT_15", "0.10"))
             require_spike = os.environ.get("REQUIRE_SPIKE", "true").lower() == "true"
@@ -1019,7 +1019,7 @@ def process_tick():
             # Per-timeframe threshold: 5m is more sensitive (smaller moves matter).
             require_cb_reversal = os.environ.get("REQUIRE_CB_REVERSAL", "true").lower() == "true"
             if tf == 5:
-                cb_reversal_threshold = float(os.environ.get("CB_REVERSAL_THRESHOLD_PCT_5", "0.015"))
+                cb_reversal_threshold = float(os.environ.get("CB_REVERSAL_THRESHOLD_PCT_5", "0.005"))
             else:
                 cb_reversal_threshold = float(os.environ.get("CB_REVERSAL_THRESHOLD_PCT_15", "0.02"))
             cb_now = get_coinbase_price(asset)
