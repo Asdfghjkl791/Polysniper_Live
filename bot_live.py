@@ -996,6 +996,17 @@ def process_tick():
             recent_revs = count_reversals_recent(hist, seconds=30)
             total_revs = count_reversals(hist)
 
+            # ─── MAX MOVE FILTER ─────────────────────────────────────────
+            # Contrarian works best when market is near-flat (mispricing).
+            # If price has moved significantly, the losing side really IS doomed.
+            # 5m: max 0.03% absolute move. 15m: max 0.06% (twice the window).
+            if tf == 5:
+                max_move_pct = float(os.environ.get("CONTRARIAN_MAX_MOVE_5", "0.03"))
+            else:
+                max_move_pct = float(os.environ.get("CONTRARIAN_MAX_MOVE_15", "0.06"))
+            if absp > max_move_pct:
+                continue  # Move too big - real trend, unlikely to reverse
+
             # ─── SUDDEN SPIKE FILTER ─────────────────────────────────────
             # If the price moved >X% in the LAST 15 SECONDS, it's a spike.
             # Spikes often retrace (good for contrarian).
@@ -1052,9 +1063,6 @@ def process_tick():
             min_c = CONFIG["min_entry_cents"]
             max_c = CONFIG["max_entry_cents"]
 
-            # DEBUG: collect asks for BTC 5m and send to Telegram occasionally
-            debug_asks = {}
-
             for dirn, token_id in [("UP", up_token), ("DOWN", down_token)]:
                 try:
                     # USE get_price() not get_order_book() - the book endpoint
@@ -1067,25 +1075,9 @@ def process_tick():
                     else:
                         ask_price = float(price_resp)
 
-                    # Also fetch midpoint and BUY-side price for debug
-                    bid_str = "—"
-                    try:
-                        mid_resp = clob_client.get_midpoint(token_id)
-                        mid_price = float(mid_resp.get("mid", 0)) if isinstance(mid_resp, dict) else float(mid_resp)
-                        if mid_price > 0:
-                            bid_str = f"mid={mid_price*100:.1f}¢"
-                    except Exception:
-                        pass
-
                     if ask_price <= 0:
-                        if asset == "BTC" and tf == 5:
-                            debug_asks[dirn] = f"INVALID({ask_price})"
                         continue
                     ask_cents = ask_price * 100
-
-                    # DEBUG: record what we see
-                    if asset == "BTC" and tf == 5:
-                        debug_asks[dirn] = f"ask={ask_cents:.1f}¢ {bid_str}"
 
                     # If ask is in target range, also require Coinbase reversal direction match
                     if min_c <= ask_cents <= max_c:
@@ -1110,27 +1102,7 @@ def process_tick():
                         break  # Only enter one direction per window
                 except Exception as e:
                     log.warning(f"Price check failed for {asset} {tf}m {dirn}: {e}")
-                    if asset == "BTC" and tf == 5:
-                        debug_asks[dirn] = f"ERR:{str(e)[:30]}"
                     continue
-
-            # DEBUG: send Telegram message with asks once per minute for BTC 5m
-            if asset == "BTC" and tf == 5 and debug_asks:
-                now_ts = time.time()
-                if now_ts - state.get("last_debug_time", 0) > 60:
-                    state["last_debug_time"] = now_ts
-                    window_ts = int(open_time.timestamp())
-                    tg(
-                        f"🔍 <b>DEBUG · BTC 5m</b>\n"
-                        f"Window: {window_ts}\n"
-                        f"UP: {debug_asks.get('UP', 'none')}\n"
-                        f"UP tok: <code>{up_token}</code>\n"
-                        f"DOWN: {debug_asks.get('DOWN', 'none')}\n"
-                        f"DOWN tok: <code>{down_token}</code>\n"
-                        f"Target: {min_c:.0f}-{max_c:.0f}¢\n"
-                        f"Secs left: {secs_left}"
-                    )
-
 
 def enter_trade_simple(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, ask_price, ask_cents, recent_revs=0, total_revs=0, spike_pct=0.0, cb_move_pct=0.0):
     """Simplified entry - no filters, just record the signal.
