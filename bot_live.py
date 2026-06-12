@@ -850,8 +850,17 @@ MAKER_CANCEL_REV_PCT     = float(os.environ.get("MAKER_CANCEL_REV_PCT", "0.02"))
 MAKER_CANCEL_T_SECS      = float(os.environ.get("MAKER_CANCEL_T_SECS", "1.0"))     # cancel unfilled remainder this close to window end
 MAKER_FILL_POLL_SECS     = float(os.environ.get("MAKER_FILL_POLL_SECS", "2.0"))
 MAKER_BINANCE_FRESH_SECS = float(os.environ.get("MAKER_BINANCE_FRESH_SECS", "10.0"))
+# Polymarket platform rule: GTC/GTD limit orders require a minimum of 5 shares
+# (≈$4.95 at a 99¢ bid). Bets below that are rejected with a 400 error.
+MAKER_MIN_SHARES         = float(os.environ.get("MAKER_MIN_SHARES", "5"))
+# Ask floor: if the best ask is below this, the market hasn't converged (it
+# disagrees with the signal) and a 99¢ limit would instantly TAKE at that low
+# price - a different, riskier bet than the maker model. Mirrors the old
+# "market disagrees" gate from taker mode.
+MAKER_MIN_ASK_CENTS      = float(os.environ.get("MAKER_MIN_ASK_CENTS", "95.0"))
 
 resting_orders = {}   # order_id -> info
+_min_size_warned = False
 resting_lock = threading.Lock()
 
 
@@ -908,9 +917,24 @@ def place_maker_order(asset, tf, direction, bet_size, open_time, close_time, w):
     if not binance_fresh(asset):
         return {"status": "failed", "error": "Binance feed stale - won't rest a blind bid"}
 
+    # Market-disagrees gate: a 99¢ limit buy CROSSES any asks below it. If the best
+    # ask is well under our bid, we'd instantly take a mid-priced position the
+    # market doesn't agree with. Skip those - this experiment is the 99¢ model.
+    try:
+        pr = clob_client.get_price(token_id, side="SELL")
+        best_ask = float(pr.get("price", 0)) if isinstance(pr, dict) else float(pr)
+        if 0 < best_ask * 100 < MAKER_MIN_ASK_CENTS:
+            return {"status": "skipped",
+                    "error": f"ask {best_ask*100:.1f}¢ < {MAKER_MIN_ASK_CENTS:.0f}¢ - market disagrees"}
+    except Exception as e:
+        log.warning(f"[MAKER] ask check failed ({e}) - proceeding without it")
+
     import math
     price = round(MAKER_BID_CENTS / 100.0, 2)
     shares = round(bet_size / price, 2)
+    if shares < MAKER_MIN_SHARES:
+        return {"status": "min_size",
+                "error": f"{shares:g} sh < {MAKER_MIN_SHARES:g}-share platform minimum (need bet >= ${MAKER_MIN_SHARES*price:.2f})"}
     if shares <= 0:
         return {"status": "failed", "error": "shares too small"}
 
@@ -933,7 +957,8 @@ def place_maker_order(asset, tf, direction, bet_size, open_time, close_time, w):
 
         with resting_lock:
             resting_orders[order_id] = dict(
-                order_id=order_id, token_id=token_id, asset=asset, tf=tf,
+                order_id=order_id, token_id=token_id, condition_id=condition_id,
+                asset=asset, tf=tf,
                 direction=direction, shares=shares, price=price,
                 open_time=open_time, close_time=close_time, w=w,
                 placed_at=time.time(), last_poll=0.0, matched=0.0,
@@ -963,13 +988,31 @@ def _finalize_maker(info, reason):
             matched = info.get("matched", 0.0)
 
         if matched and matched > 0:
-            cost = round(matched * info["price"], 4)
+            # Get the REAL average fill price (a 99¢ limit can fill lower if it
+            # crossed asks). Public data API; falls back to limit price on error.
+            avg_price = info["price"]
+            try:
+                r = requests.get(
+                    "https://data-api.polymarket.com/trades",
+                    params={"user": POLY_FUNDER, "market": info.get("condition_id", ""),
+                            "takerOnly": "false", "limit": 50},
+                    timeout=8,
+                )
+                fills = [t for t in r.json()
+                         if str(t.get("side", "")).upper() == "BUY"]
+                tot_sh = sum(float(t["size"]) for t in fills)
+                tot_usd = sum(float(t["size"]) * float(t["price"]) for t in fills)
+                if tot_sh > 0 and tot_sh >= matched * 0.9:
+                    avg_price = tot_usd / tot_sh
+            except Exception as e:
+                log.warning(f"[MAKER] fill-price lookup failed ({e}) - using limit price")
+            cost = round(matched * avg_price, 4)
             now = datetime.now(timezone.utc)
             trade = {
                 "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
                 "direction": dirn, "pct_move": round(w.get("entry_move") or 0, 4),
                 "open_price": w.get("open_price"), "entry_price": w.get("open_price"),
-                "real_entry_cents": round(info["price"] * 100, 1),
+                "real_entry_cents": round(avg_price * 100, 1),
                 "shares": matched, "cost": cost, "order_id": oid,
                 "window_open": info["open_time"].isoformat(),
                 "window_close": info["close_time"].isoformat(),
@@ -980,7 +1023,7 @@ def _finalize_maker(info, reason):
             state["trades_today"] += 1
             tg(
                 f"🟢 <b>FILLED (maker) · {emoji} {asset} {tf}m {dirn}</b>\n\n"
-                f"📦 {matched:g}/{info['shares']:g} sh @ {info['price']*100:.0f}¢ = ${cost:.2f}\n"
+                f"📦 {matched:g}/{info['shares']:g} sh @ {avg_price*100:.1f}¢ = ${cost:.2f}\n"
                 f"🪧 Closed: {reason}\n🕐 {est_str()}"
             )
             # If the window already rolled over, schedule settlement ourselves
@@ -1560,6 +1603,30 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
         emoji = ASSET_EMOJI.get(asset, "")
         arrow = "🔺" if dirn == "UP" else "🔻"
         result = place_maker_order(asset, tf, dirn, bet, open_time, close_time, w)
+        if result["status"] == "skipped":
+            # Best ask below the floor - market disagrees with the signal. Log and
+            # skip the window; no Telegram spam (same as taker-mode skips).
+            w["skipped"] = True
+            log.info(f"[MAKER] skipped {asset} {tf}m {dirn}: {result['error']}")
+            db_log_skip(asset, tf, dirn, pct, w["open_price"], 0,
+                        result["error"], open_time, close_time, secs_left)
+            return
+        if result["status"] == "min_size":
+            # Bet too small for Polymarket's 5-share limit-order minimum. Skip this
+            # window (retrying won't change the bet) and warn once per boot.
+            w["skipped"] = True
+            global _min_size_warned
+            if not _min_size_warned:
+                _min_size_warned = True
+                tg(
+                    f"⚠️ <b>Bet too small for maker orders</b>\n\n"
+                    f"Polymarket limit orders need ≥{MAKER_MIN_SHARES:g} shares "
+                    f"(${MAKER_MIN_SHARES*MAKER_BID_CENTS/100:.2f} at {MAKER_BID_CENTS:.0f}¢).\n"
+                    f"Current bet: ${bet:.2f}\n"
+                    f"Set BET_SIZE_DAY / BET_SIZE_NIGHT to {MAKER_MIN_SHARES*MAKER_BID_CENTS/100:.2f} or more."
+                )
+            log.warning(f"[MAKER] {result['error']}")
+            return
         if result["status"] == "resting":
             w["traded"] = True
             w["direction"] = dirn
