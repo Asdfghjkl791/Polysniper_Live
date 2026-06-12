@@ -163,7 +163,12 @@ market_cache = {}  # cache of slug → token IDs
 
 # ─── TIME HELPERS ────────────────────────────────────────────────────────────
 def est_now():
-    return datetime.now(timezone.utc) - timedelta(hours=4)
+    # Proper Eastern time (handles daylight saving). Falls back to fixed UTC-4.
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return datetime.now(timezone.utc) - timedelta(hours=4)
 
 def current_bet_size():
     """
@@ -349,7 +354,7 @@ def handle_commands():
             tg(
                 f"{status_e} <b>{status_w}</b>\n\n"
                 f"💰 Balance: <b>${state['balance_usd']:.2f}</b>\n"
-                f"🎯 Bet: ${CONFIG['bet_size']}\n"
+                f"🎯 Bet: ${current_bet_size():g} (day ${CONFIG['bet_size_day']:g} / night ${CONFIG['bet_size_night']:g})\n"
                 f"📊 Today: {state['trades_today']} · ${state['pnl_today']:+.2f}\n"
                 f"🏆 All-time: {total} · {wr} · ${pnl:+.2f}\n"
                 f"⏭ Skipped: {skipped}\n"
@@ -802,16 +807,253 @@ def lag_report_worker():
             log.error(f"Lag report error: {e}")
 
 
+_binance_thread_started = False
+
+def start_binance_feed():
+    """Start the shared Binance stream once (used by lag measurement AND maker mode)."""
+    global _binance_thread_started
+    if _binance_thread_started:
+        return True
+    if not WEBSOCKET_AVAILABLE:
+        log.warning("[Binance WS] websocket-client missing - feed disabled")
+        return False
+    threading.Thread(target=binance_ws_worker, daemon=True).start()
+    _binance_thread_started = True
+    return True
+
+
 def start_lag_measurement():
     if not LAG_MEASURE:
         log.info("[LAG] disabled (LAG_MEASURE=false)")
         return False
-    if not WEBSOCKET_AVAILABLE:
-        log.warning("[LAG] websocket-client missing - lag measurement disabled")
+    if not start_binance_feed():
         return False
-    threading.Thread(target=binance_ws_worker, daemon=True).start()
     threading.Thread(target=lag_report_worker, daemon=True).start()
     log.info("[LAG] Binance lag measurement started (hourly Telegram reports)")
+    return True
+
+
+# ─── MAKER MODE: rest 99¢ limit bids instead of taking the ask ────────────────
+# WHY: taker FAK orders need shares on the ask side, which is exactly what's
+# missing at the right moments ("no match" / empty book at 100¢). The profitable
+# wallet does the opposite: it RESTS a limit BUY at 99¢ and lets sellers come to
+# it - it never races the fast bots and never needs the ask side at all.
+# PROTECTION is not entry-time statistics; it's the live Binance feed:
+#   - the resting bid is cancelled within ~1s if Binance turns against the bet
+#   - any unfilled remainder is cancelled just before the window closes
+#   - no bid is ever placed (and any resting bid is pulled) if Binance goes dark,
+#     because a blind resting order is pure adverse-selection bait.
+# Toggle with MAKER_MODE=false to return to the old taker behavior.
+MAKER_MODE               = os.environ.get("MAKER_MODE", "true").lower() == "true"
+MAKER_BID_CENTS          = float(os.environ.get("MAKER_BID_CENTS", "99.0"))
+MAKER_CANCEL_REV_PCT     = float(os.environ.get("MAKER_CANCEL_REV_PCT", "0.02"))   # Binance move against bet (~5s window) that cancels
+MAKER_CANCEL_T_SECS      = float(os.environ.get("MAKER_CANCEL_T_SECS", "1.0"))     # cancel unfilled remainder this close to window end
+MAKER_FILL_POLL_SECS     = float(os.environ.get("MAKER_FILL_POLL_SECS", "2.0"))
+MAKER_BINANCE_FRESH_SECS = float(os.environ.get("MAKER_BINANCE_FRESH_SECS", "10.0"))
+
+resting_orders = {}   # order_id -> info
+resting_lock = threading.Lock()
+
+
+def binance_fresh(asset):
+    return time.time() - binance_last_update.get(asset, 0) <= MAKER_BINANCE_FRESH_SECS
+
+
+def binance_recent_move_pct(asset):
+    """Signed % move on Binance over the recent tick window (~last 5s). None if no data."""
+    dq = _lag_ticks.get(asset)
+    if not dq or len(dq) < 2:
+        return None
+    _, first_p = dq[0]
+    _, last_p = dq[-1]
+    if first_p <= 0:
+        return None
+    return (last_p - first_p) / first_p * 100
+
+
+def cancel_clob_order(order_id):
+    try:
+        resp = clob_client.cancel(order_id)
+        log.info(f"[MAKER] cancel {str(order_id)[:12]}: {str(resp)[:120]}")
+        return True
+    except Exception as e:
+        log.warning(f"[MAKER] cancel failed {str(order_id)[:12]}: {e}")
+        return False
+
+
+def get_order_matched(order_id):
+    """Return (matched_shares, status) for an order, or (None, None) on error."""
+    try:
+        o = clob_client.get_order(order_id)
+        if isinstance(o, dict):
+            matched = float(o.get("size_matched", o.get("sizeMatched", 0)) or 0)
+            status = str(o.get("status", ""))
+        else:
+            matched = float(getattr(o, "size_matched", 0) or 0)
+            status = str(getattr(o, "status", ""))
+        return matched, status
+    except Exception as e:
+        log.warning(f"[MAKER] get_order failed {str(order_id)[:12]}: {e}")
+        return None, None
+
+
+def place_maker_order(asset, tf, direction, bet_size, open_time, close_time, w):
+    """Rest a GTC limit BUY at MAKER_BID_CENTS on the signal side. Returns status dict."""
+    condition_id, up_token, down_token = find_market_for_window(asset, tf, open_time)
+    if not up_token:
+        return {"status": "failed", "error": "Market not found"}
+    token_id = up_token if direction == "UP" else down_token
+
+    # Never rest a bid we can't watch: a blind resting order is adverse-selection bait.
+    if not binance_fresh(asset):
+        return {"status": "failed", "error": "Binance feed stale - won't rest a blind bid"}
+
+    import math
+    price = round(MAKER_BID_CENTS / 100.0, 2)
+    shares = round(bet_size / price, 2)
+    if shares <= 0:
+        return {"status": "failed", "error": "shares too small"}
+
+    try:
+        order_args = OrderArgs(token_id=token_id, price=price, size=shares, side=BUY)
+        resp = clob_client.create_and_post_order(
+            order_args,
+            options=PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+            order_type=OrderType.GTC,
+        )
+        log.info(f"[MAKER] place response: {str(resp)[:200]}")
+        if isinstance(resp, dict):
+            success = resp.get("success", False) or resp.get("status") in ("live", "matched")
+            order_id = resp.get("orderID") or resp.get("orderId")
+        else:
+            success = getattr(resp, "success", False)
+            order_id = getattr(resp, "orderID", None)
+        if not success or not order_id:
+            return {"status": "failed", "error": f"not accepted: {str(resp)[:120]}"}
+
+        with resting_lock:
+            resting_orders[order_id] = dict(
+                order_id=order_id, token_id=token_id, asset=asset, tf=tf,
+                direction=direction, shares=shares, price=price,
+                open_time=open_time, close_time=close_time, w=w,
+                placed_at=time.time(), last_poll=0.0, matched=0.0,
+                notified_fill=False, done=False,
+            )
+        return {"status": "resting", "order_id": order_id, "shares": shares,
+                "entry_cents": price * 100}
+    except Exception as e:
+        log.error(f"[MAKER] place error: {e}")
+        return {"status": "failed", "error": str(e)}
+
+
+def _finalize_maker(info, reason):
+    """Cancel remainder, take the final fill count, record the trade if anything filled."""
+    if info.get("done"):
+        return
+    info["done"] = True
+    oid = info["order_id"]
+    asset, tf, dirn = info["asset"], info["tf"], info["direction"]
+    emoji = ASSET_EMOJI.get(asset, "")
+    w = info["w"]
+    try:
+        cancel_clob_order(oid)
+        time.sleep(0.5)
+        matched, _status = get_order_matched(oid)
+        if matched is None:
+            matched = info.get("matched", 0.0)
+
+        if matched and matched > 0:
+            cost = round(matched * info["price"], 4)
+            now = datetime.now(timezone.utc)
+            trade = {
+                "entered_at": now.isoformat(), "asset": asset, "timeframe": tf,
+                "direction": dirn, "pct_move": round(w.get("entry_move") or 0, 4),
+                "open_price": w.get("open_price"), "entry_price": w.get("open_price"),
+                "real_entry_cents": round(info["price"] * 100, 1),
+                "shares": matched, "cost": cost, "order_id": oid,
+                "window_open": info["open_time"].isoformat(),
+                "window_close": info["close_time"].isoformat(),
+            }
+            db_id = db_insert_trade(trade)
+            w["trade_db_id"] = db_id
+            state["balance_usd"] -= cost
+            state["trades_today"] += 1
+            tg(
+                f"🟢 <b>FILLED (maker) · {emoji} {asset} {tf}m {dirn}</b>\n\n"
+                f"📦 {matched:g}/{info['shares']:g} sh @ {info['price']*100:.0f}¢ = ${cost:.2f}\n"
+                f"🪧 Closed: {reason}\n🕐 {est_str()}"
+            )
+            # If the window already rolled over, schedule settlement ourselves
+            # (settle() has a guard so it can't run twice for the same window).
+            if datetime.now(timezone.utc) >= info["close_time"]:
+                settle(w, asset, tf, prices.get(asset) or w.get("open_price"))
+        else:
+            # Nothing filled - free the one-asset-at-a-time slot.
+            if active_directions.get((asset, tf)) == dirn:
+                del active_directions[(asset, tf)]
+            log.info(f"[MAKER] {asset} {tf}m {dirn} expired unfilled ({reason})")
+    except Exception as e:
+        log.error(f"[MAKER] finalize error: {e}")
+    finally:
+        with resting_lock:
+            resting_orders.pop(oid, None)
+
+
+def maker_monitor():
+    """Watches all resting bids: cancels on Binance reversal, stale feed, or window
+    end; polls fill progress. Runs every 0.5s."""
+    while True:
+        try:
+            time.sleep(0.5)
+            if not resting_orders:
+                continue
+            now_dt = datetime.now(timezone.utc)
+            with resting_lock:
+                items = list(resting_orders.values())
+            for info in items:
+                if info.get("done"):
+                    continue
+                asset, dirn = info["asset"], info["direction"]
+                secs_to_close = (info["close_time"] - now_dt).total_seconds()
+
+                if secs_to_close <= MAKER_CANCEL_T_SECS:
+                    threading.Thread(target=_finalize_maker, args=(info, "window closing"), daemon=True).start()
+                    continue
+                if not binance_fresh(asset):
+                    threading.Thread(target=_finalize_maker, args=(info, "Binance feed went stale"), daemon=True).start()
+                    continue
+                mv = binance_recent_move_pct(asset)
+                if mv is not None:
+                    against = (dirn == "UP" and mv <= -MAKER_CANCEL_REV_PCT) or \
+                              (dirn == "DOWN" and mv >= MAKER_CANCEL_REV_PCT)
+                    if against:
+                        threading.Thread(target=_finalize_maker, args=(info, f"Binance reversal {mv:+.3f}%"), daemon=True).start()
+                        continue
+
+                now = time.time()
+                if now - info["last_poll"] >= MAKER_FILL_POLL_SECS:
+                    info["last_poll"] = now
+                    matched, _status = get_order_matched(info["order_id"])
+                    if matched is not None:
+                        if matched > info["matched"]:
+                            info["matched"] = matched
+                            if not info["notified_fill"]:
+                                info["notified_fill"] = True
+                                emoji = ASSET_EMOJI.get(asset, "")
+                                tg(f"🪧 <b>Bid filling · {emoji} {asset} {info['tf']}m {dirn}</b>\n"
+                                   f"{matched:g}/{info['shares']:g} sh @ {info['price']*100:.0f}¢")
+                        if matched >= info["shares"] - 0.01:
+                            threading.Thread(target=_finalize_maker, args=(info, "fully filled"), daemon=True).start()
+        except Exception as e:
+            log.error(f"[MAKER] monitor error: {e}")
+
+
+def start_maker_monitor():
+    if not MAKER_MODE:
+        log.info("[MAKER] disabled (MAKER_MODE=false) - taker FAK orders in use")
+        return False
+    threading.Thread(target=maker_monitor, daemon=True).start()
+    log.info(f"[MAKER] monitor started (bid {MAKER_BID_CENTS:.0f}¢ · cancel on {MAKER_CANCEL_REV_PCT}% Binance reversal)")
     return True
 
 
@@ -1237,7 +1479,7 @@ def process_tick():
                 log.info(f"Skipped {asset} {tf}m {dirn} - too volatile ({volatility:.4f}%/s)")
                 continue
 
-            if revs > max_revs:
+            if (not MAKER_MODE) and revs > max_revs:
                 w["skipped"] = True
                 tg(
                     f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
@@ -1255,7 +1497,8 @@ def process_tick():
             # Conviction check (5min only): skip if move is weakening significantly (reversal in progress)
             # Compares move % now vs move % ~30 seconds ago
             # Tolerance is per-asset (ETH is tighter due to more losses)
-            if tf == 5:
+            # MAKER MODE: skipped - the live Binance cancel trigger does this job better.
+            if tf == 5 and not MAKER_MODE:
                 # Per-asset weakening tolerance (in % points)
                 weakening_tolerance_map = {
                     "BTC":  float(os.environ.get("WEAKENING_TOLERANCE_BTC",  "0.05")),
@@ -1288,7 +1531,7 @@ def process_tick():
             choppy_limit = CONFIG["choppy_threshold"]
             if asset == "ETH":
                 choppy_limit = int(os.environ.get("CHOPPY_THRESHOLD_ETH", "15"))
-            if recent_revs >= choppy_limit:
+            if (not MAKER_MODE) and recent_revs >= choppy_limit:
                 w["skipped"] = True
                 tg(
                     f"⏭ <b>SKIPPED · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
@@ -1310,6 +1553,30 @@ def process_tick():
 def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs=0, recent_revs=0):
     bet = min(current_bet_size(), state["balance_usd"])
     if bet < CONFIG["min_balance"]:
+        return
+
+    # ── MAKER PATH: rest a limit bid at 99¢ and let sellers come to us ──
+    if MAKER_MODE and not SIGNALS_ONLY_MODE:
+        emoji = ASSET_EMOJI.get(asset, "")
+        arrow = "🔺" if dirn == "UP" else "🔻"
+        result = place_maker_order(asset, tf, dirn, bet, open_time, close_time, w)
+        if result["status"] == "resting":
+            w["traded"] = True
+            w["direction"] = dirn
+            w["entry_move"] = pct
+            w["entry_revs"] = revs
+            w["entry_recent_revs"] = recent_revs
+            active_directions[(asset, tf)] = dirn
+            tg(
+                f"🪧 <b>RESTING BID · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
+                f"📈 Move: {pct:+.3f}%\n"
+                f"💵 {result['shares']:g} sh @ <b>{MAKER_BID_CENTS:.0f}¢</b> (${bet:.2f})\n"
+                f"⏱ {secs_left}s left · auto-cancel on Binance reversal\n"
+                f"🕐 {est_str()}"
+            )
+        else:
+            # Failed (market not found, stale feed, rejected) - allow retry next cycle
+            log.warning(f"[MAKER] place failed (will retry): {result.get('error')}")
         return
 
     result = place_order(asset, tf, dirn, bet, open_time)
@@ -1638,7 +1905,11 @@ def settle(w, asset, tf, close_price):
     """
     Schedules settlement in a background thread so the main loop isn't blocked.
     The settlement retries fetching Polymarket's outcome for up to 60 seconds.
+    Guarded so the same window can never be settled twice (rollover + maker finalize).
     """
+    if w.get("_settle_started"):
+        return
+    w["_settle_started"] = True
     # Capture state we need (in case window state changes during settlement)
     settle_data = {
         "trade_db_id": w["trade_db_id"],
@@ -1791,7 +2062,13 @@ def main():
     # Start Binance lag measurement (measure-only; hourly Telegram reports)
     lag_ok = start_lag_measurement()
 
-    mode_str = "🚨 SIGNALS-ONLY" if SIGNALS_ONLY_MODE else "🤖 AUTO-TRADING"
+    # Maker mode needs the Binance feed for cancel triggers, even if lag reports are off
+    if MAKER_MODE:
+        start_binance_feed()
+    maker_ok = start_maker_monitor()
+
+    mode_str = "🚨 SIGNALS-ONLY" if SIGNALS_ONLY_MODE else (
+        f"🪧 MAKER - resting {MAKER_BID_CENTS:.0f}¢ bids" if maker_ok else "🤖 TAKER - FAK orders")
 
     tg(
         f"🚀 <b>PolySniper LIVE v4.1</b>\n"
@@ -1799,7 +2076,7 @@ def main():
         f"🎯 <b>EARLY ENTRY STRATEGY</b>\n\n"
         f"🟠 BTC · 🔷 ETH · 🟣 SOL · 🟡 DOGE · 🟨 BNB\n"
         f"⏱ 5min + 15min\n"
-        f"💵 Bet size: ${CONFIG['bet_size']}\n"
+        f"💵 Bet: ${CONFIG['bet_size_day']:g} day / ${CONFIG['bet_size_night']:g} night (now ${current_bet_size():g})\n"
         f"⏰ Entry window: last {CONFIG['entry_window_seconds']}s\n"
         f"💲 Entry range: {CONFIG['min_entry_cents']:.0f}-{CONFIG['max_entry_cents']:.0f}¢\n"
         f"🛑 Stop loss: {CONFIG['stop_loss_cents']:.0f}¢\n"
