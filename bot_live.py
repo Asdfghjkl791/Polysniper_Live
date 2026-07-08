@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
-# PAPER TAKER v1.0 — does taking beat making on the SAME gate? (no money)
+# PAPER LONGSHOT v1.0 — buy the CHEAP side (1-5¢) in the FIRST MINUTE (no money)
 #
 # THE QUESTION
-#   The maker bot rests a 99¢ bid and gets filled by whoever hits it — which
-#   selects it into the losing half of its own signals (sellers dump reversing
-#   trades onto the resting bid). A TAKER with the SAME entry gate instead
-#   crosses the spread the instant the gate fires — taking ALL its flagged
-#   trades at the moment of its choosing, not just the ones a seller chose to
-#   fill. This bot tests, on paper, whether that execution change clears
-#   break-even. It uses the maker bot's EXACT frontier gate and reads the SAME
-#   live Polymarket books, but places NOTHING. It records the real ask it would
-#   have crossed and scores every simulated trade at settlement.
+#   The taker/maker bots buy the near-certain 99¢ side. This bot tests the exact
+#   opposite: buy the CHEAP longshot side (1-5¢) right at the open, before the
+#   window has resolved anything. At 1-5¢ you only need to be right ~1-5% of the
+#   time to break even, and every win pays 20-100x. This bot asks, on paper:
+#   does the market SYSTEMATICALLY misprice the cheap side early? If the true
+#   flip rate on a 1-5¢ side is higher than the price implies, this prints; if
+#   the market prices it fairly, it bleeds slowly. The scoreboard decides.
+#
+# THE STRATEGY (as specified)
+#   • Enter ONLY in the first 60 seconds of a window (5m: secs_left 240-300;
+#     15m: secs_left 840-900). Early = the outcome is still maximally uncertain,
+#     so the cheap side is cheapest.
+#   • NO move gate. The price band IS the filter.
+#   • Buy EITHER side whose live ask is in [1¢, 5¢]. If BOTH sides are 1-5¢
+#     (rare, only in dead-flat markets) it takes both.
+#   • One entry per side per window (MAX_STACK slots shared across the window).
 #
 # WHY PAPER FIRST
-#   The diagnosis (maker selection hurts) is well-supported. The fix (taking
-#   clears break-even) is NOT proven — taking pays the ask, which may be 99-100¢
-#   and kill the edge anyway. So we score it on live prices for a few hundred
-#   trades and let the numbers decide before a cent goes in. Same discipline as
-#   the EUR/USD bot.
+#   Longshot betting is where naive strategies die fastest — the payout math
+#   looks incredible (100x!) but if the win rate is even slightly below the
+#   price, you bleed. So score it live on real Polymarket asks for a few hundred
+#   windows before a cent goes in. Same discipline as every other bot.
 #
 # HONEST LIMITS
-#   • It assumes the displayed ask is takeable for the full size — real taking
-#     can get worse fills in fast markets, so paper results are an UPPER bound.
-#   • It uses Chainlink settlement (same oracle Polymarket uses) to grade.
-#   • No fees modeled (Polymarket taker fees ~0 on these, but confirm).
+#   • Assumes the displayed ask is takeable for full size — UPPER bound on fills.
+#   • A 1-5¢ side often has THIN size; real fills may be worse or partial.
+#   • Grades off the reference feed direction at close (same as taker bot).
+#   • No fees modeled.
+#   • Selection reality: the cheap side is cheap BECAUSE it usually loses. This
+#     bot only wins if the market OVER-charges for that near-certainty. Read the
+#     scoreboard, not the payout fantasy.
 #
 # ENV (required): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# ENV (optional): PAPER_STAKE=5, TAKER_MAX_ASK_CENTS=99.5 (skip if ask above
-#   this — the "don't overpay" guard), DB_PATH=paper_taker.db, TIMEFRAMES=5,
+# ENV (optional): PAPER_STAKE=5, ENTRY_MIN_CENTS=1, ENTRY_MAX_CENTS=5,
+#   FIRST_MIN_SECS=60 (how long the entry window stays open after open),
+#   BUY_BOTH_SIDES=true, DB_PATH=paper_longshot.db, TIMEFRAMES=5,15,
 #   SEND_EACH=true
 
 import os
@@ -38,7 +48,6 @@ import logging
 import threading
 import requests
 from datetime import datetime, timezone
-from collections import deque
 
 try:
     import websocket
@@ -49,121 +58,38 @@ except ImportError:
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PAPER_STAKE      = float(os.environ.get("PAPER_STAKE", "5"))
-TAKER_MAX_ASK_CENTS = float(os.environ.get("TAKER_MAX_ASK_CENTS", "99.5"))
-# Floor: skip entries CHEAPER than this — the market pricing an outcome below
-# this is telling you it's too uncertain (the 89¢ coin-flip that lost). Note:
-# tightening the band [MIN, MAX] does NOT create an edge — inside the band, win
-# rate still ≈ price paid. It only stops the bot taking obviously-uncertain
-# trades. Default 0 = no floor (take anything up to the ceiling).
-TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "0"))
-DB_PATH          = os.environ.get("DB_PATH", "paper_taker.db")
+# The entry band. Buy a side only if its live ask sits in [MIN, MAX] cents.
+ENTRY_MIN_CENTS  = float(os.environ.get("ENTRY_MIN_CENTS", "1"))
+ENTRY_MAX_CENTS  = float(os.environ.get("ENTRY_MAX_CENTS", "5"))
+# Only enter during the first FIRST_MIN_SECS seconds after the window opens.
+FIRST_MIN_SECS   = float(os.environ.get("FIRST_MIN_SECS", "60"))
+# If both sides land in the band (dead-flat market), take both. Else take the
+# cheaper one only.
+BUY_BOTH_SIDES   = os.environ.get("BUY_BOTH_SIDES", "true").lower() == "true"
+DB_PATH          = os.environ.get("DB_PATH", "paper_longshot.db")
 SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
-# Fast grading: grade instantly off the reference feed at window close (~1s),
-# then confirm against real Polymarket settlement when it lands and correct any
-# disagreement. FAST_GRADE=true gives ~1s results; false uses settlement-only
-# (accurate but 1-3 min). Epsilon: a window only provisionally ties if |move| is
-# below this (in %), else it grades UP/DOWN immediately.
-FAST_GRADE       = os.environ.get("FAST_GRADE", "true").lower() == "true"
 FAST_TIE_EPS_PCT = float(os.environ.get("FAST_TIE_EPS_PCT", "0.0005"))
-# Stacking: up to MAX_STACK entries per window (like the live maker bot,
-# which added clips as the move re-qualified). STACK_COOLDOWN_SECS spaces
-# them out so it doesn't take all 3 in the same instant. Each entry reads
-# its own live ask, so later clips may get a different price. NOTE: the 3
-# stacked entries share ONE window outcome — read win RATE (per-entry, fine)
-# more than trade COUNT (which triple-counts a window).
-MAX_STACK           = int(os.environ.get("MAX_STACK", "1"))
-STACK_COOLDOWN_SECS = float(os.environ.get("STACK_COOLDOWN_SECS", "8"))
-TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5").split(",")]
+TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5,15").split(",")]
 
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
 
-# ── GATE: guessed 5m table (from bot_variant.py) + measured 15m table (from
-#    bot_variant_MEASURED.py). This is the config you asked to paper-test:
-#    your real guessed 5-minute strategy, paired with the probe-MEASURED 15m
-#    surface (more defensible than the guessed scaling rule for 15m). ──
-PER_ASSET_FRONTIER = {          # 5m — GUESSED (matches live bot_variant.py)
-    "BTC":  [(20, 0.025), (40, 0.04), (70, 0.08), (120, 0.15)],
-    "ETH":  [(20, 0.03), (40, 0.07), (70, 0.11), (120, 0.16)],
-    "XRP":  [(20, 0.04), (40, 0.10), (70, 0.15), (120, 0.23)],
-    "DOGE": [(20, 0.05), (40, 0.10), (70, 0.15), (120, 0.22)],
-    "BNB":  [(20, 0.04), (40, 0.10), (70, 0.17), (120, 0.20)],
-    "SOL":  [(20, 0.10), (40, 0.17), (70, 0.21), (120, 0.27)],
-    "HYPE": [(20, 0.16), (40, 0.20), (70, 0.24), (120, 0.30)],
-}
-PER_ASSET_FRONTIER_15M = {      # 15m — MEASURED (from the probe grid)
-    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.10)],
-    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "SOL":  [(10, 0.10), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.20)],
-    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
-    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
-    "HYPE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-}
-# 5m fallback mirrors the guessed bot's global gate; 15m falls back to its table.
-GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
-GLOBAL_FRONTIER_15M = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
-FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
-HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
-
-
-def _frontier_lookup(bands, secs_left):
-    for max_secs, min_move in bands:
-        if secs_left <= max_secs:
-            return min_move
-    return FRONTIER_FALLBACK_PCT
-
-
-def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
-    if secs_left <= 0:
-        return False
-    if tf == 15:
-        bands = PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER_15M)
-    else:
-        bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
-    need = _frontier_lookup(bands, secs_left)
-    if asset == "HYPE" and tf != 15:
-        need = max(need, HYPE_MIN_MOVE_PCT)   # guessed-5m HYPE floor only
-    return abs_move_pct >= need
-
-
-# ── FEEDS ────────────────────────────────────────────────────────────────────
-CHAINLINK_SYMBOLS = {"BTC": "btc/usd", "ETH": "eth/usd", "SOL": "sol/usd",
-                     "DOGE": "doge/usd", "BNB": "bnb/usd", "XRP": "xrp/usd",
-                     "HYPE": "hype/usd"}
-CHAINLINK_SYMBOL_TO_ASSET = {v: k for k, v in CHAINLINK_SYMBOLS.items()}
-CHAINLINK_WS_URL = os.environ.get("CHAINLINK_WS_URL",
-                                  "wss://ws-subscriptions-clob.polymarket.com/ws/market")
 CLOB_BASE = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=[logging.StreamHandler()])
-log = logging.getLogger("paper-taker")
+log = logging.getLogger("paper-longshot")
 
-prices_chainlink = {}
-chainlink_last_update = {}
-
-# NOTE ON THE PRICE FEED
-#   The maker bot has a working Chainlink push feed and Polymarket market lookup.
-#   Rather than duplicate that whole stack here (hundreds of lines, keys, market
-#   resolution), this paper bot reads Chainlink prices from the SAME public
-#   Binance-mirror the maker bot uses for its reference leg, and reads live
-#   Polymarket asks via the public CLOB /book endpoint per resolved token. To
-#   keep this file self-contained and runnable, it expects the maker bot's
-#   market-resolution helper module OR falls back to the Binance.vision mirror
-#   for the open/settlement price. The order-book ask read is the one live
-#   Polymarket call it makes.
+# ── REFERENCE FEED (for grading only — NOT used to gate entries) ─────────────
 BINANCE_WS = ("wss://data-stream.binance.vision/stream?streams=" +
               "/".join(f"{s}usdt@bookTicker" for s in
                        ["btc", "eth", "sol", "doge", "bnb", "xrp"]))
-# HYPE has no Binance spot pair — it will simply be skipped if no price arrives.
 BINANCE_SYM_TO_ASSET = {f"{s.upper()}USDT": s.upper()
                         for s in ["btc", "eth", "sol", "doge", "bnb", "xrp"]}
-
-prices_ref = {}          # reference price per asset (proxy for Chainlink settle)
+prices_ref = {}
 ref_last = {}
 
 
@@ -179,8 +105,7 @@ def binance_ref_worker():
                 if not msg:
                     continue
                 d = json.loads(msg).get("data", {})
-                sym = d.get("s")
-                a = BINANCE_SYM_TO_ASSET.get(sym)
+                a = BINANCE_SYM_TO_ASSET.get(d.get("s"))
                 if a:
                     b, k = float(d.get("b", 0)), float(d.get("a", 0))
                     if b > 0 and k > 0:
@@ -196,8 +121,8 @@ def binance_ref_worker():
         time.sleep(3)
 
 
-# ── POLYMARKET MARKET RESOLUTION + ASK READ ──────────────────────────────────
-_market_cache = {}   # (asset,tf,open_ts) -> (up_token, down_token) or None
+# ── POLYMARKET MARKET RESOLUTION + ASK READ ─────────────────────────────────
+_market_cache = {}
 
 
 def resolve_tokens(asset, tf, open_ts):
@@ -213,7 +138,7 @@ def resolve_tokens(asset, tf, open_ts):
         if markets:
             toks = json.loads(markets[0].get("clobTokenIds", "[]"))
             if len(toks) == 2:
-                _market_cache[key] = (toks[0], toks[1])  # [UP, DOWN] by convention
+                _market_cache[key] = (toks[0], toks[1])  # [UP, DOWN]
                 return _market_cache[key]
     except Exception as e:
         log.debug(f"[RESOLVE] {slug}: {e}")
@@ -227,58 +152,11 @@ def best_ask_cents(token_id):
         r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=6)
         b = r.json()
         asks = b.get("asks", [])
-        if not asks:
-            return None
-        # asks sorted; best (lowest) ask is the last or first depending on API —
-        # take the min price with size.
         prices = [float(a["price"]) for a in asks if float(a.get("size", 0)) > 0]
         if not prices:
             return None
         return min(prices) * 100.0
     except Exception:
-        return None
-
-
-
-def fetch_polymarket_outcome(asset, tf, open_ts):
-    """Read the ACTUAL settled outcome from Polymarket (Chainlink-resolved), same
-    method the maker bot uses. Returns 'UP', 'DOWN', 'TIE', or None (not settled
-    yet / error). No price inference — this is the real market resolution, so the
-    fake-tie-from-stale-feed problem disappears."""
-    slug = f"{asset.lower()}-updown-{tf}m-{open_ts}"
-    try:
-        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10)
-        data = r.json()
-        if not data or not isinstance(data, list):
-            log.info(f"[OUTCOME] {slug}: no event (resp type {type(data).__name__}, "
-                     f"len {len(data) if hasattr(data,'__len__') else '?'})")
-            return None
-        markets = data[0].get("markets", [])
-        if not markets:
-            log.info(f"[OUTCOME] {slug}: event found but no markets")
-            return None
-        op = markets[0].get("outcomePrices")
-        if isinstance(op, str):
-            try:
-                op = json.loads(op)
-            except Exception:
-                pass
-        if not op or len(op) < 2:
-            log.info(f"[OUTCOME] {slug}: no outcomePrices yet (raw={op})")
-            return None
-        up_p, down_p = float(op[0]), float(op[1])
-        if up_p >= 0.99:
-            log.info(f"[OUTCOME] {slug}: settled UP {op}")
-            return "UP"
-        if down_p >= 0.99:
-            log.info(f"[OUTCOME] {slug}: settled DOWN {op}")
-            return "DOWN"
-        # Anything else — including ~[0.5,0.5] — is NOT settled yet (Up/Down
-        # markets sit near 50/50 before Chainlink resolves). Never a tie; wait.
-        log.info(f"[OUTCOME] {slug}: not settled yet (prices {op})")
-        return None
-    except Exception as e:
-        log.warning(f"[OUTCOME] {slug}: ERROR {e}")
         return None
 
 
@@ -297,21 +175,21 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS paper (
         id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT,
         asset TEXT, tf INTEGER, direction TEXT, open_ts INTEGER, close_ts INTEGER,
-        secs_left REAL, move_pct REAL, ask_cents REAL, open_price REAL,
+        secs_into REAL, ask_cents REAL, open_price REAL,
         settle_price REAL, result TEXT, pnl REAL)""")
     conn.execute("UPDATE paper SET result='VOID' WHERE result='PENDING'")
     conn.commit()
     conn.close()
 
 
-def db_insert(asset, tf, direction, open_ts, close_ts, secs_left, move, ask, open_price):
+def db_insert(asset, tf, direction, open_ts, close_ts, secs_into, ask, open_price):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""INSERT INTO paper (created,asset,tf,direction,open_ts,close_ts,
-                 secs_left,move_pct,ask_cents,open_price,result)
-                 VALUES (?,?,?,?,?,?,?,?,?,?, 'PENDING')""",
+                 secs_into,ask_cents,open_price,result)
+                 VALUES (?,?,?,?,?,?,?,?,?, 'PENDING')""",
               (datetime.now(timezone.utc).isoformat(), asset, tf, direction,
-               open_ts, close_ts, secs_left, move, ask, open_price))
+               open_ts, close_ts, secs_into, ask, open_price))
     rid = c.lastrowid
     conn.commit()
     conn.close()
@@ -337,7 +215,9 @@ def db_scoreboard():
     pnl = sum(r[1] or 0 for r in rows)
     avg_ask = (sum(r[2] or 0 for r in rows) / len(rows)) if rows else 0
     wr = (wins / len(dec) * 100) if dec else None
-    be = (avg_ask) if avg_ask else 99.0   # break-even win% ≈ avg ask paid (cents)
+    # break-even win% for a longshot ≈ avg ask paid (cents). At 3¢ you need to
+    # win ~3% of the time. The whole bet is: is real WR > this tiny number?
+    be = avg_ask if avg_ask else ENTRY_MAX_CENTS
     return {"n": len(rows), "wins": wins, "wr": wr, "pnl": pnl,
             "avg_ask": avg_ask, "be": be}
 
@@ -371,106 +251,93 @@ def handle_commands():
             if t == "/stats":
                 s = db_scoreboard()
                 wr = f"{s['wr']:.1f}%" if s["wr"] is not None else "—"
-                verdict = ("ABOVE break-even ✅" if s["wr"] and s["wr"] > s["be"]
-                           else "below break-even ⚠️")
-                tg(f"📄 <b>PAPER TAKER scoreboard</b>\n"
+                verdict = ("ABOVE break-even ✅ (mispriced in our favor)"
+                           if s["wr"] and s["wr"] > s["be"]
+                           else "below break-even ⚠️ (market pricing it fairly)")
+                tg(f"📄 <b>PAPER LONGSHOT scoreboard</b>\n"
                    f"simulated trades: {s['n']}\n"
                    f"win rate: <b>{wr}</b>\n"
-                   f"avg ask paid: {s['avg_ask']:.1f}¢ → break-even ≈ {s['be']:.1f}%\n"
+                   f"avg ask paid: {s['avg_ask']:.2f}¢ → break-even ≈ {s['be']:.2f}%\n"
                    f"{verdict}\n"
-                   f"paper P&L: <b>${s['pnl']:+.2f}</b> ({PAPER_STAKE:g}/trade)")
+                   f"paper P&L: <b>${s['pnl']:+.2f}</b> (${PAPER_STAKE:g}/trade)")
     except Exception:
         pass
 
 
-# ── SIGNAL/SCORING ENGINE ────────────────────────────────────────────────────
-open_windows = {}     # (asset,tf,open_ts) -> open_price captured at window start
-pending = []          # simulated trades awaiting settlement
+# ── ENGINE ───────────────────────────────────────────────────────────────────
+open_windows = {}     # (asset,tf,open_ts) -> open_price at window start
+fired_sides = {}      # (asset,tf,open_ts) -> set of directions already taken
+pending = []
 pending_lock = threading.Lock()
-fired_count = {}      # (asset,tf,open_ts) -> num entries taken this window
-fired_last = {}       # (asset,tf,open_ts) -> ts of last entry (for cooldown)
 
 
 def engine():
     while True:
         try:
             time.sleep(0.5)
-            now = time.time()
             for tf in TFS:
                 open_ts, close_ts, secs_left = window_times(tf)
+                length = tf * 60
+                secs_into = length - secs_left
                 for asset in ASSET_LIST:
                     ref = prices_ref.get(asset)
                     if ref is None:
                         continue
                     wkey = (asset, tf, open_ts)
-                    # capture open price once
+                    # capture open price once, the first time we see the window
                     if wkey not in open_windows:
                         open_windows[wkey] = ref
+                    # ENTRY GATE 1: first minute only
+                    if secs_into > FIRST_MIN_SECS:
                         continue
-                    op = open_windows[wkey]
-                    move = (ref - op) / op * 100.0
-                    direction = "UP" if move >= 0 else "DOWN"
-                    absmove = abs(move)
-                    # SAME GATE as the maker bot
-                    if fired_count.get(wkey, 0) >= MAX_STACK:
-                        continue  # window already at its stack limit
-                    if time.time() - fired_last.get(wkey, 0) < STACK_COOLDOWN_SECS:
-                        continue  # space stacked entries out (re-qualify over time)
-                    if not frontier_locked(asset, absmove, secs_left, tf):
-                        continue
-                    # gate fired — simulate TAKING: read the live ask we'd cross
+                    taken = fired_sides.setdefault(wkey, set())
+                    if len(taken) >= 2:
+                        continue  # both sides already taken this window
                     toks = resolve_tokens(asset, tf, open_ts)
                     if not toks:
                         continue
                     up_tok, down_tok = toks
-                    tok = up_tok if direction == "UP" else down_tok
-                    ask = best_ask_cents(tok)
-                    if ask is None:
+                    op = open_windows[wkey]
+                    # check each side's live ask against the band
+                    candidates = []  # (direction, ask)
+                    for direction, tok in (("UP", up_tok), ("DOWN", down_tok)):
+                        if direction in taken:
+                            continue
+                        ask = best_ask_cents(tok)
+                        if ask is None:
+                            continue
+                        if ENTRY_MIN_CENTS <= ask <= ENTRY_MAX_CENTS:
+                            candidates.append((direction, ask))
+                    if not candidates:
                         continue
-                    # set cooldown regardless (so we don't re-hit the same instant),
-                    # but only a real take consumes a STACK SLOT.
-                    fired_last[wkey] = time.time()
-                    if ask > TAKER_MAX_ASK_CENTS or ask < TAKER_MIN_ASK_CENTS:
-                        # outside the accepted band — record why and skip
-                        why = ("too high" if ask > TAKER_MAX_ASK_CENTS
-                               else "too uncertain")
-                        log.info(f"[PAPER] {asset} {tf}m {direction} gate fired but "
-                                 f"ask {ask:.1f}¢ {why} "
-                                 f"(band {TAKER_MIN_ASK_CENTS:.0f}-{TAKER_MAX_ASK_CENTS:.0f}¢) — skip")
+                    # if not buying both, keep only the cheaper qualifying side
+                    if not BUY_BOTH_SIDES and len(candidates) > 1:
+                        candidates = [min(candidates, key=lambda x: x[1])]
+                    for direction, ask in candidates:
+                        rid = db_insert(asset, tf, direction, open_ts, close_ts,
+                                        secs_into, ask, op)
+                        taken.add(direction)
+                        with pending_lock:
+                            pending.append({"rid": rid, "asset": asset, "tf": tf,
+                                            "direction": direction,
+                                            "close_ts": close_ts, "open_price": op,
+                                            "ask": ask})
                         if SEND_EACH:
-                            tg(f"⚪ PAPER skip {ASSET_EMOJI.get(asset,'')}{asset} {tf}m "
-                               f"{direction} · ask {ask:.1f}¢ {why} ({absmove:.3f}% "
-                               f"@{secs_left:.0f}s)")
-                        continue
-                    rid = db_insert(asset, tf, direction, open_ts, close_ts,
-                                    secs_left, move, ask, op)
-                    fired_count[wkey] = fired_count.get(wkey, 0) + 1
-                    clip_n = fired_count[wkey]
-                    with pending_lock:
-                        pending.append({"rid": rid, "asset": asset, "tf": tf,
-                                        "direction": direction, "open_ts": open_ts,
-                                        "close_ts": close_ts,
-                                        "open_price": op, "ask": ask})
-                    if SEND_EACH:
-                        arrow = "⬆️" if direction == "UP" else "⬇️"
-                        clip_tag = f" clip {clip_n}/{MAX_STACK}" if MAX_STACK > 1 else ""
-                        tg(f"📄 <b>PAPER TAKE {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
-                           f"{tf}m {direction}{clip_tag}</b>\n"
-                           f"take ask <b>{ask:.1f}¢</b> · move {move:+.3f}% @{secs_left:.0f}s left\n"
-                           f"(would stake ${PAPER_STAKE:g}, win +${PAPER_STAKE*(100-ask)/ask:.2f} / "
-                           f"lose -${PAPER_STAKE:.2f})")
-                    log.info(f"[PAPER] TAKE {asset} {tf}m {direction} ask {ask:.1f}¢ "
-                             f"move {move:+.3f}% {secs_left:.0f}s left")
+                            arrow = "⬆️" if direction == "UP" else "⬇️"
+                            payout = PAPER_STAKE * (100 - ask) / ask
+                            tg(f"📄 <b>PAPER LONGSHOT {arrow} "
+                               f"{ASSET_EMOJI.get(asset,'')}{asset} {tf}m {direction}</b>\n"
+                               f"buy ask <b>{ask:.1f}¢</b> · {secs_into:.0f}s into window\n"
+                               f"(stake ${PAPER_STAKE:g} → win +${payout:.2f} / "
+                               f"lose -${PAPER_STAKE:.2f})")
+                        log.info(f"[PAPER] BUY {asset} {tf}m {direction} ask {ask:.1f}¢ "
+                                 f"{secs_into:.0f}s into window")
         except Exception as e:
             log.error(f"[ENGINE] {e}")
 
 
 def scorer():
-    """Grade off the reference feed at window close (~1s after). The feed tracks
-    the same price the market settles on, so close-vs-open direction IS the
-    outcome. No Polymarket settlement read (that field is trading price, not
-    resolution, and never cleanly flips). Waits up to 30s for a feed price at
-    close, else voids."""
+    """Grade off the reference feed direction at window close (~1s after)."""
     while True:
         try:
             time.sleep(0.5)
@@ -485,14 +352,11 @@ def scorer():
                 if settle is None:
                     if now > s["close_ts"] + 30:
                         db_resolve(s["rid"], None, "VOID", 0)
-                        log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — no feed price at close")
                         with pending_lock:
                             s in pending and pending.remove(s)
                     continue
                 move = (settle - op) / op * 100.0
                 if abs(move) < FAST_TIE_EPS_PCT:
-                    # essentially no move — wait a bit for the feed to tick off
-                    # the exact open; void only if it truly never moves.
                     if now > s["close_ts"] + 30:
                         db_resolve(s["rid"], None, "VOID", 0)
                         with pending_lock:
@@ -511,9 +375,11 @@ def scorer():
                 tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
                    f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f} "
                    f"({move:+.3f}%)\n"
-                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
+                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.2f}%) \u00b7 "
+                   f"P&L ${sb['pnl']:+.2f}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
+
 
 def main():
     if not WEBSOCKET_AVAILABLE:
@@ -523,10 +389,11 @@ def main():
     threading.Thread(target=binance_ref_worker, daemon=True).start()
     threading.Thread(target=engine, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
-    tg(f"📄 <b>PAPER TAKER live</b> — no money\n"
-       f"same gate as the maker bot; simulates TAKING the ask instead of resting a bid\n"
-       f"tf={TFS} · stake ${PAPER_STAKE:g} · skip if ask > {TAKER_MAX_ASK_CENTS:.0f}¢\n"
-       f"the scoreboard decides: does taking clear break-even?\n/stats")
+    tg(f"📄 <b>PAPER LONGSHOT live</b> — no money\n"
+       f"buys the CHEAP side ({ENTRY_MIN_CENTS:.0f}-{ENTRY_MAX_CENTS:.0f}¢) in the "
+       f"first {FIRST_MIN_SECS:.0f}s of each window\n"
+       f"tf={TFS} · stake ${PAPER_STAKE:g} · both sides={BUY_BOTH_SIDES}\n"
+       f"the scoreboard decides: is the cheap side mispriced?\n/stats")
     while True:
         try:
             handle_commands()
