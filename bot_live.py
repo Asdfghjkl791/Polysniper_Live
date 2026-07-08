@@ -56,7 +56,7 @@ TAKER_MAX_ASK_CENTS = float(os.environ.get("TAKER_MAX_ASK_CENTS", "5"))   # long
 # rate still ≈ price paid. It only stops the bot taking obviously-uncertain
 # trades. Default 0 = no floor (take anything up to the ceiling).
 TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "1"))   # longshot floor
-DB_PATH          = os.environ.get("DB_PATH", "paper_taker.db")
+DB_PATH          = os.environ.get("DB_PATH", "paper_reversal.db")
 SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
 FAST_GRADE       = os.environ.get("FAST_GRADE", "true").lower() == "true"
 FAST_TIE_EPS_PCT = float(os.environ.get("FAST_TIE_EPS_PCT", "0.0005"))
@@ -66,6 +66,20 @@ FAST_TIE_EPS_PCT = float(os.environ.get("FAST_TIE_EPS_PCT", "0.0005"))
 # in the message) so rare longshot data points are not lost to VOIDs.
 SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
 SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "900"))
+
+# ── REVERSAL CONFIG — last-seconds trailing-side buyer ───────────────────────
+# The 2.4M-sample probe table: with 10-20s left, a 0.02-0.05% move still
+# reverses ~10% of the time; under 0.02% it reverses ~32%. This bot buys the
+# TRAILING side of a small late move — but ONLY when its ask is under that
+# bucket's measured comeback rate (minus margin). If the market charges more,
+# the trade is skipped and the ask is logged: the skip census is itself the
+# answer to "does the market price these reversals fairly?"
+REV_MAX_SECS_LEFT = float(os.environ.get("REV_MAX_SECS_LEFT", "20"))
+REV_MOVE_MAX_PCT  = float(os.environ.get("REV_MOVE_MAX_PCT", "0.05"))
+REV_BUCKET_SPLIT  = float(os.environ.get("REV_BUCKET_SPLIT", "0.02"))
+REV_MAX_ASK_TINY  = float(os.environ.get("REV_MAX_ASK_TINY", "25"))   # <0.02%: comeback ~32
+REV_MAX_ASK_SMALL = float(os.environ.get("REV_MAX_ASK_SMALL", "8"))   # 0.02-0.05%: ~10
+REV_MIN_ASK       = float(os.environ.get("REV_MIN_ASK", "1"))
 # Stacking: up to MAX_STACK entries per window (like the live maker bot,
 # which added clips as the move re-qualified). STACK_COOLDOWN_SECS spaces
 # them out so it doesn't take all 3 in the same instant. Each entry reads
@@ -158,7 +172,7 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=[logging.StreamHandler()])
-log = logging.getLogger("paper-longshot")
+log = logging.getLogger("paper-reversal")
 
 prices_chainlink = {}
 chainlink_last_update = {}
@@ -386,16 +400,35 @@ def handle_commands():
             if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
             if t == "/stats":
-                s = db_scoreboard()
-                wr = f"{s['wr']:.1f}%" if s["wr"] is not None else "—"
-                verdict = ("ABOVE break-even ✅" if s["wr"] and s["wr"] > s["be"]
-                           else "below break-even ⚠️")
-                tg(f"🎰 <b>PAPER LONGSHOT scoreboard</b>\n"
-                   f"simulated trades: {s['n']}\n"
-                   f"win rate: <b>{wr}</b>\n"
-                   f"avg ask paid: {s['avg_ask']:.1f}¢ → break-even ≈ {s['be']:.1f}%\n"
-                   f"{verdict}\n"
-                   f"paper P&L: <b>${s['pnl']:+.2f}</b> ({PAPER_STAKE:g}/trade)")
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT ABS(move_pct), result, pnl, ask_cents FROM paper "
+                          "WHERE result IN ('WIN','LOSS')")
+                rows = c.fetchall()
+                conn.close()
+                def bstats(sub):
+                    n = len(sub)
+                    w = sum(1 for r in sub if r[1] == "WIN")
+                    pnl = sum(r[2] or 0 for r in sub)
+                    aask = (sum(r[3] or 0 for r in sub) / n) if n else 0.0
+                    return n, w, ((w / n * 100) if n else None), aask, pnl
+                tiny = [r for r in rows if r[0] < REV_BUCKET_SPLIT]
+                small = [r for r in rows if r[0] >= REV_BUCKET_SPLIT]
+                lines = []
+                for name, sub, hist in ((f"tiny <{REV_BUCKET_SPLIT:.2f}%", tiny, 32),
+                                        (f"small {REV_BUCKET_SPLIT:.2f}-{REV_MOVE_MAX_PCT:.2f}%", small, 10)):
+                    n, w, wr, aask, pnl = bstats(sub)
+                    if n == 0:
+                        lines.append(f"{name}: no trades yet (hist. comeback ~{hist}%)")
+                    else:
+                        mark = "✅" if wr is not None and wr > aask else "⚠️"
+                        lines.append(f"{name}: {w}/{n} ({wr:.1f}%) vs BE {aask:.1f}¢ {mark} · ${pnl:+.2f}")
+                nA, wA, wrA, aaskA, pnlA = bstats(rows)
+                wr_s = f"{wrA:.1f}%" if wrA is not None else "—"
+                tg("🔄 <b>REVERSAL scoreboard</b> (last-20s trailing side)\n"
+                   f"all: {nA} · {wr_s} win · P&L <b>${pnlA:+.2f}</b>\n"
+                   + "\n".join(lines) +
+                   "\nbucket is +EV only if win% beats its avg ask")
     except Exception:
         pass
 
@@ -433,36 +466,45 @@ def engine():
                     if op is None:
                         continue  # window had no clean open; never enter it
                     move = (ref - op) / op * 100.0
-                    # LONGSHOT LOGIC: no move threshold. Only enter in the FIRST
-                    # minute, and buy whichever side (UP or DOWN) has an ask in the
-                    # 1-5c band — the deep longshot the market has already priced
-                    # against. If neither side is in band, no entry.
+                    absmove = abs(move)
+                    # REVERSAL LOGIC — final REV_MAX_SECS_LEFT seconds only. When
+                    # the move from open is SMALL, the probe table says the
+                    # trailing side still comes back often (~32% under 0.02%,
+                    # ~10% at 0.02-0.05%, at 10-20s left). Buy the TRAILING side,
+                    # but only if its ask is UNDER the bucket's comeback-rate cap
+                    # — i.e. only when the market charges less than the comeback
+                    # is historically worth.
                     if fired_count.get(wkey, 0) >= MAX_STACK:
                         continue
-                    elapsed = (tf * 60) - secs_left
-                    if elapsed > ENTRY_FIRST_SECS:
-                        continue  # past the first minute — window closed for entry
+                    if time.time() - fired_last.get(wkey, 0) < STACK_COOLDOWN_SECS:
+                        continue  # throttle re-checks (a skipped ask can still
+                                  # drop into the cap later in the final seconds)
+                    if secs_left > REV_MAX_SECS_LEFT:
+                        continue  # only the final seconds
+                    if absmove >= REV_MOVE_MAX_PCT or move == 0.0:
+                        continue  # too big (frontier territory) or no leader yet
+                    bucket = "tiny" if absmove < REV_BUCKET_SPLIT else "small"
+                    cap = REV_MAX_ASK_TINY if bucket == "tiny" else REV_MAX_ASK_SMALL
+                    direction = "DOWN" if move > 0 else "UP"   # the trailing side
                     toks = resolve_tokens(asset, tf, open_ts)
                     if not toks:
                         continue
                     up_tok, down_tok = toks
-                    up_ask = best_ask_cents(up_tok)
-                    down_ask = best_ask_cents(down_tok)
-                    # pick whichever side is in the longshot band; if both are
-                    # (shouldn't happen), take the cheaper.
-                    cand = []
-                    if up_ask is not None and TAKER_MIN_ASK_CENTS <= up_ask <= TAKER_MAX_ASK_CENTS:
-                        cand.append(("UP", up_ask))
-                    if down_ask is not None and TAKER_MIN_ASK_CENTS <= down_ask <= TAKER_MAX_ASK_CENTS:
-                        cand.append(("DOWN", down_ask))
-                    if not cand:
-                        continue  # no longshot available this pass
-                    direction, ask = min(cand, key=lambda x: x[1])
+                    ask = best_ask_cents(up_tok if direction == "UP" else down_tok)
                     fired_last[wkey] = time.time()
+                    if ask is None:
+                        continue
+                    if ask < REV_MIN_ASK or ask > cap:
+                        # the market charges more than the comeback is worth —
+                        # skip, but LOG the ask: this census answers whether the
+                        # market prices small-move reversals fairly.
+                        log.info(f"[REV-SKIP] {asset} {tf}m {direction} ask {ask:.1f}¢ "
+                                 f"> cap {cap:.0f}¢ ({bucket}, move {move:+.3f}%, "
+                                 f"{secs_left:.0f}s left)")
+                        continue
                     rid = db_insert(asset, tf, direction, open_ts, close_ts,
                                     secs_left, move, ask, op)
                     fired_count[wkey] = fired_count.get(wkey, 0) + 1
-                    clip_n = fired_count[wkey]
                     with pending_lock:
                         pending.append({"rid": rid, "asset": asset, "tf": tf,
                                         "direction": direction, "open_ts": open_ts,
@@ -470,12 +512,15 @@ def engine():
                                         "open_price": op, "ask": ask})
                     if SEND_EACH:
                         arrow = "⬆️" if direction == "UP" else "⬇️"
-                        clip_tag = f" clip {clip_n}/{MAX_STACK}" if MAX_STACK > 1 else ""
-                        tg(f"📄 <b>PAPER TAKE {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
-                           f"{tf}m {direction}{clip_tag}</b>\n"
-                           f"take ask <b>{ask:.1f}¢</b> · move {move:+.3f}% @{secs_left:.0f}s left\n"
-                           f"(would stake ${PAPER_STAKE:g}, win +${PAPER_STAKE*(100-ask)/ask:.2f} / "
-                           f"lose -${PAPER_STAKE:.2f})")
+                        shares = PAPER_STAKE / (ask / 100.0)
+                        win_amt = shares * 1.0 - PAPER_STAKE
+                        hist = 32 if bucket == "tiny" else 10
+                        tg(f"🔄 <b>REVERSAL {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
+                           f"{tf}m buy {direction}</b>\n"
+                           f"<b>{ask:.1f}¢</b> ({shares:.0f} sh) · leader {move:+.3f}% · "
+                           f"{secs_left:.0f}s left\n"
+                           f"{bucket} bucket (hist. comeback ~{hist}%) · "
+                           f"win +${win_amt:.2f} / lose -${PAPER_STAKE:.2f}")
                     log.info(f"[PAPER] TAKE {asset} {tf}m {direction} ask {ask:.1f}¢ "
                              f"move {move:+.3f}% {secs_left:.0f}s left")
         except Exception as e:
@@ -505,31 +550,19 @@ def scorer():
                 s["last_outcome_check"] = now
 
                 outcome = fetch_polymarket_outcome(s["asset"], s["tf"], s["open_ts"])
-                graded_by = "settlement"
                 if outcome is None:
                     if now <= s["close_ts"] + SETTLE_TIMEOUT_SECS:
                         continue  # not resolved yet — keep waiting
-                    # timeout: settlement never appeared. Fall back to the feed so
-                    # a rare longshot data point isn't lost — tagged as such.
-                    settle_px = prices_ref.get(s["asset"])
-                    op = s["open_price"]
-                    if settle_px is None or op is None:
-                        db_resolve(s["rid"], None, "VOID", 0)
-                        log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — "
-                                    f"no settlement and no feed price")
-                        with pending_lock:
-                            s in pending and pending.remove(s)
-                        continue
-                    move = (settle_px - op) / op * 100.0
-                    if abs(move) < 1e-6:
-                        db_resolve(s["rid"], None, "VOID", 0)
-                        with pending_lock:
-                            s in pending and pending.remove(s)
-                        continue
-                    outcome = "UP" if move > 0 else "DOWN"
-                    graded_by = "feed-fallback"
-                    log.warning(f"[SCORER] settlement timeout {s['asset']} "
-                                f"{s['tf']}m — feed-graded {outcome}")
+                    # timeout: NO feed fallback here. This bot's trades live in
+                    # near-flat windows — exactly where the feed and Chainlink
+                    # can disagree — so an ungradeable trade is VOID, never
+                    # guessed.
+                    db_resolve(s["rid"], None, "VOID", 0)
+                    log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — "
+                                f"no settlement within timeout")
+                    with pending_lock:
+                        s in pending and pending.remove(s)
+                    continue
 
                 won = (s["direction"] == outcome)
                 shares = PAPER_STAKE / (s["ask"] / 100.0)
@@ -541,11 +574,10 @@ def scorer():
                 sb = db_scoreboard()
                 emoji = "\u2705" if won else "\u274c"
                 wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
-                tag = "" if graded_by == "settlement" else " \u26a0\ufe0f feed-graded"
-                tg(f"{emoji} LONGSHOT {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
+                tg(f"{emoji} REVERSAL {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
                    f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f}"
-                   f" \u00b7 bought {s['ask']:.1f}\u00a2{tag}\n"
-                   f"\U0001f3b0 {sb['n']} trades \u00b7 {wr} win \u00b7 P&L ${sb['pnl']:+.2f}")
+                   f" \u00b7 bought {s['ask']:.1f}\u00a2\n"
+                   f"\U0001f504 {sb['n']} trades \u00b7 {wr} win \u00b7 P&L ${sb['pnl']:+.2f}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
 
@@ -557,10 +589,12 @@ def main():
     threading.Thread(target=binance_ref_worker, daemon=True).start()
     threading.Thread(target=engine, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
-    tg(f"🎰 <b>PAPER LONGSHOT live</b> — no money\n"
-       f"same gate as the maker bot; simulates TAKING the ask instead of resting a bid\n"
-       f"tf={TFS} · stake ${PAPER_STAKE:g} · skip if ask > {TAKER_MAX_ASK_CENTS:.0f}¢\n"
-       f"the scoreboard decides: does taking clear break-even?\n/stats")
+    tg(f"🔄 <b>PAPER REVERSAL live</b> — no money\n"
+       f"final {REV_MAX_SECS_LEFT:.0f}s: if the move is under {REV_MOVE_MAX_PCT:.2f}%, "
+       f"buy the TRAILING side when its ask is under the bucket cap\n"
+       f"caps: tiny(<{REV_BUCKET_SPLIT:.2f}%) ≤{REV_MAX_ASK_TINY:.0f}¢ · "
+       f"small ≤{REV_MAX_ASK_SMALL:.0f}¢ · tf={TFS} · stake ${PAPER_STAKE:g}\n"
+       f"settlement-graded ONLY (near-flat windows are never feed-guessed)\n/stats")
     while True:
         try:
             handle_commands()
