@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-# PAPER LONGSHOT — buys 1-5c deep-underdog side in the first minute (no money)
+# PAPER LONGSHOT — buys 1-5c deep-underdog side early in each window (no money)
+# Supports 5m, 15m, and 1h (60) timeframes. 5m/15m use timestamp slugs; hourly
+# uses the date-based slug (bitcoin-up-or-down-july-12-2026-8pm-et). A startup
+# probe confirms hourly markets resolve before trusting them.
 import os, time, json, sqlite3, logging, threading, requests
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 try:
     import websocket
     WEBSOCKET_AVAILABLE = True
@@ -16,21 +20,24 @@ TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "1"))
 DB_PATH          = os.environ.get("DB_PATH", "paper_longshot.db")
 SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
 SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
-SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "900"))
+SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "1800"))
 MAX_STACK           = int(os.environ.get("MAX_STACK", "1"))
-STACK_COOLDOWN_SECS = float(os.environ.get("STACK_COOLDOWN_SECS", "8"))
-TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5,15").split(",")]
-# LONGSHOT entry windows — per timeframe. 5m: first 60s. 15m: first 180s (3 min).
-ENTRY_FIRST_SECS     = float(os.environ.get("ENTRY_FIRST_SECS", "60"))
-ENTRY_FIRST_SECS_15M = float(os.environ.get("ENTRY_FIRST_SECS_15M", "180"))
-ENTRY_FIRST_SECS_30M = float(os.environ.get("ENTRY_FIRST_SECS_30M", "600"))  # 30m: first 10 min
+# Timeframes: 5, 15, 60 (60 = hourly). 30 is NOT a real Polymarket timeframe.
+TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5,15,60").split(",")]
+# Entry windows per timeframe (seconds from window open).
+ENTRY_FIRST_SECS     = float(os.environ.get("ENTRY_FIRST_SECS", "60"))       # 5m: 1 min
+ENTRY_FIRST_SECS_15M = float(os.environ.get("ENTRY_FIRST_SECS_15M", "180"))  # 15m: 3 min
+ENTRY_FIRST_SECS_60M = float(os.environ.get("ENTRY_FIRST_SECS_60M", "900"))  # 1h: 15 min
 OPEN_CAPTURE_GRACE   = float(os.environ.get("OPEN_CAPTURE_GRACE", "3"))
 
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
+ASSET_FULLNAME = {"BTC":"bitcoin","ETH":"ethereum","SOL":"solana",
+                  "DOGE":"dogecoin","BNB":"bnb","XRP":"xrp","HYPE":"hype"}
 CLOB_BASE = "https://clob.polymarket.com"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+ET = ZoneInfo("America/New_York")
 BINANCE_WS = ("wss://data-stream.binance.vision/stream?streams=" +
               "/".join(f"{s}usdt@bookTicker" for s in
                        ["btc", "eth", "sol", "doge", "bnb", "xrp"]))
@@ -73,13 +80,38 @@ def binance_ref_worker():
         time.sleep(3)
 
 
+def window_times(tf):
+    """For 5/15: timestamp-aligned. For 60 (hourly): aligned to top of ET hour."""
+    now = time.time()
+    if tf == 60:
+        now_et = datetime.now(timezone.utc).astimezone(ET)
+        start_et = now_et.replace(minute=0, second=0, microsecond=0)
+        o = int(start_et.timestamp())
+        return o, o + 3600, o + 3600 - now
+    L = tf * 60
+    o = int(now // L) * L
+    return o, o + L, o + L - now
+
+
+def build_slug(asset, tf, open_ts):
+    if tf == 60:
+        dt_et = datetime.fromtimestamp(open_ts, tz=ET)
+        month = dt_et.strftime("%B").lower()
+        day = dt_et.day
+        year = dt_et.year
+        hour12 = dt_et.strftime("%I").lstrip("0") or "12"
+        ampm = dt_et.strftime("%p").lower()
+        return f"{ASSET_FULLNAME[asset]}-up-or-down-{month}-{day}-{year}-{hour12}{ampm}-et"
+    return f"{asset.lower()}-updown-{tf}m-{open_ts}"
+
+
 _market_cache = {}
 
 def resolve_tokens(asset, tf, open_ts):
     key = (asset, tf, open_ts)
     if key in _market_cache:
         return _market_cache[key]
-    slug = f"{asset.lower()}-updown-{tf}m-{open_ts}"
+    slug = build_slug(asset, tf, open_ts)
     try:
         r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=8)
         arr = r.json()
@@ -108,7 +140,7 @@ def best_ask_cents(token_id):
 
 
 def fetch_polymarket_outcome(asset, tf, open_ts):
-    slug = f"{asset.lower()}-updown-{tf}m-{open_ts}"
+    slug = build_slug(asset, tf, open_ts)
     try:
         r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10)
         data = r.json()
@@ -136,11 +168,12 @@ def fetch_polymarket_outcome(asset, tf, open_ts):
         return None
 
 
-def window_times(tf):
-    now = int(time.time())
-    L = tf * 60
-    o = (now // L) * L
-    return o, o + L, o + L - now
+def entry_window_secs(tf):
+    if tf == 60:
+        return ENTRY_FIRST_SECS_60M
+    if tf == 15:
+        return ENTRY_FIRST_SECS_15M
+    return ENTRY_FIRST_SECS
 
 
 def init_db():
@@ -180,14 +213,21 @@ def db_resolve(rid, settle_price, result, pnl):
 def db_scoreboard():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT result, pnl, ask_cents FROM paper WHERE result IN ('WIN','LOSS')")
+    c.execute("SELECT result, pnl, ask_cents, tf FROM paper WHERE result IN ('WIN','LOSS')")
     rows = c.fetchall()
     conn.close()
     wins = sum(1 for r in rows if r[0] == "WIN")
     pnl = sum(r[1] or 0 for r in rows)
     avg = (sum(r[2] or 0 for r in rows) / len(rows)) if rows else 0
     wr = (wins / len(rows) * 100) if rows else None
-    return {"n": len(rows), "wins": wins, "wr": wr, "pnl": pnl, "avg_ask": avg}
+    by_tf = {}
+    for r in rows:
+        d = by_tf.setdefault(r[3], {"n": 0, "w": 0, "pnl": 0.0})
+        d["n"] += 1
+        d["w"] += 1 if r[0] == "WIN" else 0
+        d["pnl"] += r[1] or 0
+    return {"n": len(rows), "wins": wins, "wr": wr, "pnl": pnl,
+            "avg_ask": avg, "by_tf": by_tf}
 
 
 def tg(msg):
@@ -225,10 +265,17 @@ def handle_commands():
             if t == "/stats":
                 s = db_scoreboard()
                 wr = f"{s['wr']:.1f}%" if s["wr"] is not None else "—"
+                tf_lines = []
+                for tf in sorted(s["by_tf"]):
+                    d = s["by_tf"][tf]
+                    label = "1h" if tf == 60 else f"{tf}m"
+                    twr = d["w"]/d["n"]*100 if d["n"] else 0
+                    tf_lines.append(f"  {label}: {d['w']}/{d['n']} ({twr:.0f}%) ${d['pnl']:+.2f}")
                 tg(f"🎰 <b>PAPER LONGSHOT scoreboard</b>\n"
                    f"trades: {s['n']} · win rate: <b>{wr}</b>\n"
                    f"avg ask: {s['avg_ask']:.1f}¢\n"
-                   f"P&L: <b>${s['pnl']:+.2f}</b> (${PAPER_STAKE:g}/trade)")
+                   + ("\n".join(tf_lines) if tf_lines else "") +
+                   f"\nP&L: <b>${s['pnl']:+.2f}</b> (${PAPER_STAKE:g}/trade)")
     except Exception:
         pass
 
@@ -240,14 +287,33 @@ fired_count = {}
 fired_last = {}
 
 
+def probe():
+    """Confirm hourly markets resolve (only if 60 is in TFS)."""
+    if 60 not in TFS:
+        return
+    open_ts, close_ts, secs_left = window_times(60)
+    found = []
+    for a in ASSET_LIST:
+        toks = resolve_tokens(a, 60, open_ts)
+        if toks:
+            found.append(a)
+        _market_cache.pop((a, 60, open_ts), None)
+    if found:
+        tg(f"🔎 <b>Hourly probe</b>: resolved {len(found)}/7 "
+           f"({', '.join(found)})\nslug: <code>{build_slug('BTC',60,open_ts)}</code>")
+    else:
+        tg(f"⚠️ <b>Hourly probe FAILED</b>: 0/7 resolved\n"
+           f"tried <code>{build_slug('BTC',60,open_ts)}</code> — 1h won't fire")
+    log.info(f"[PROBE] hourly found {found}")
+
+
 def engine():
     while True:
         try:
             time.sleep(0.5)
             for tf in TFS:
                 open_ts, close_ts, secs_left = window_times(tf)
-                first_secs = (ENTRY_FIRST_SECS_30M if tf == 30 else
-                              ENTRY_FIRST_SECS_15M if tf == 15 else ENTRY_FIRST_SECS)
+                first_secs = entry_window_secs(tf)
                 for asset in ASSET_LIST:
                     ref = prices_ref.get(asset)
                     if ref is None:
@@ -255,7 +321,8 @@ def engine():
                     wkey = (asset, tf, open_ts)
                     if wkey not in open_windows:
                         elapsed = (tf * 60) - secs_left
-                        if elapsed <= OPEN_CAPTURE_GRACE:
+                        # For hourly, capture whenever first seen (grace is generous)
+                        if elapsed <= OPEN_CAPTURE_GRACE or tf == 60:
                             open_windows[wkey] = ref
                         else:
                             open_windows[wkey] = None
@@ -268,7 +335,7 @@ def engine():
                         continue
                     elapsed = (tf * 60) - secs_left
                     if elapsed > first_secs:
-                        continue  # past this timeframe's entry window
+                        continue
                     toks = resolve_tokens(asset, tf, open_ts)
                     if not toks:
                         continue
@@ -294,12 +361,13 @@ def engine():
                     if SEND_EACH:
                         arrow = "⬆️" if direction == "UP" else "⬇️"
                         shares = PAPER_STAKE / (ask / 100.0)
+                        label = "1h" if tf == 60 else f"{tf}m"
                         tg(f"🎰 <b>LONGSHOT {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
-                           f"{tf}m {direction}</b>\n"
-                           f"ask <b>{ask:.1f}¢</b> ({shares:.0f} sh) · {secs_left:.0f}s left "
-                           f"(elapsed {elapsed:.0f}s ≤ {first_secs:.0f}s)\n"
+                           f"{label} {direction}</b>\n"
+                           f"ask <b>{ask:.1f}¢</b> ({shares:.0f} sh) · "
+                           f"elapsed {elapsed:.0f}s ≤ {first_secs:.0f}s\n"
                            f"win +${shares*1.0-PAPER_STAKE:.2f} / lose -${PAPER_STAKE:.2f}")
-                    log.info(f"[LONGSHOT] {asset} {tf}m {direction} ask {ask:.1f}¢ "
+                    log.info(f"[LONGSHOT] {asset} {tf} {direction} ask {ask:.1f}¢ "
                              f"elapsed {elapsed:.0f}s")
         except Exception as e:
             log.error(f"[ENGINE] {e}")
@@ -343,8 +411,9 @@ def scorer():
                 emoji = "\u2705" if won else "\u274c"
                 wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
                 tag = "" if graded_by == "settlement" else " \u26a0\ufe0f feed-graded"
+                label = "1h" if s["tf"] == 60 else f"{s['tf']}m"
                 tg(f"{emoji} LONGSHOT {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                   f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f} "
+                   f"{label} {s['direction']} <b>{result}</b> ${pnl:+.2f} "
                    f"\u00b7 {s['ask']:.1f}\u00a2{tag}\n"
                    f"\U0001f3b0 {sb['n']} trades \u00b7 {wr} win \u00b7 P&L ${sb['pnl']:+.2f}")
         except Exception as e:
@@ -357,12 +426,15 @@ def main():
         return
     init_db()
     threading.Thread(target=binance_ref_worker, daemon=True).start()
-    threading.Thread(target=engine, daemon=True).start()
-    threading.Thread(target=scorer, daemon=True).start()
+    labels = ", ".join("1h" if t == 60 else f"{t}m" for t in TFS)
     tg(f"🎰 <b>PAPER LONGSHOT live</b> — no money\n"
        f"buys 1-5¢ side · 5m: first {ENTRY_FIRST_SECS:.0f}s · "
-       f"15m: first {ENTRY_FIRST_SECS_15M:.0f}s · 30m: first {ENTRY_FIRST_SECS_30M:.0f}s\n"
-       f"tf={TFS} · stake ${PAPER_STAKE:g}\n/stats")
+       f"15m: first {ENTRY_FIRST_SECS_15M:.0f}s · 1h: first {ENTRY_FIRST_SECS_60M:.0f}s\n"
+       f"tf={labels} · stake ${PAPER_STAKE:g}\n/stats")
+    time.sleep(3)
+    probe()
+    threading.Thread(target=engine, daemon=True).start()
+    threading.Thread(target=scorer, daemon=True).start()
     while True:
         try:
             handle_commands()
