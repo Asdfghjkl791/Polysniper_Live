@@ -28,6 +28,7 @@ TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5,15,60").spli
 ENTRY_FIRST_SECS     = float(os.environ.get("ENTRY_FIRST_SECS", "60"))       # 5m: 1 min
 ENTRY_FIRST_SECS_15M = float(os.environ.get("ENTRY_FIRST_SECS_15M", "180"))  # 15m: 3 min
 ENTRY_FIRST_SECS_60M = float(os.environ.get("ENTRY_FIRST_SECS_60M", "900"))  # 1h: 15 min
+ENTRY_FIRST_SECS_240M = float(os.environ.get("ENTRY_FIRST_SECS_240M", "3600"))  # 4h: first hour
 OPEN_CAPTURE_GRACE   = float(os.environ.get("OPEN_CAPTURE_GRACE", "3"))
 
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
@@ -88,12 +89,20 @@ def window_times(tf):
         start_et = now_et.replace(minute=0, second=0, microsecond=0)
         o = int(start_et.timestamp())
         return o, o + 3600, o + 3600 - now
+    if tf == 240:
+        now_et = datetime.now(timezone.utc).astimezone(ET)
+        block_hour = (now_et.hour // 4) * 4   # 0,4,8,12,16,20
+        start_et = now_et.replace(hour=block_hour, minute=0, second=0, microsecond=0)
+        o = int(start_et.timestamp())
+        return o, o + 14400, o + 14400 - now
     L = tf * 60
     o = int(now // L) * L
     return o, o + L, o + L - now
 
 
 def build_slug(asset, tf, open_ts):
+    if tf == 240:
+        return f"{asset.lower()}-updown-4h-{open_ts}"
     if tf == 60:
         dt_et = datetime.fromtimestamp(open_ts, tz=ET)
         month = dt_et.strftime("%B").lower()
@@ -169,6 +178,8 @@ def fetch_polymarket_outcome(asset, tf, open_ts):
 
 
 def entry_window_secs(tf):
+    if tf == 240:
+        return ENTRY_FIRST_SECS_240M
     if tf == 60:
         return ENTRY_FIRST_SECS_60M
     if tf == 15:
@@ -268,7 +279,7 @@ def handle_commands():
                 tf_lines = []
                 for tf in sorted(s["by_tf"]):
                     d = s["by_tf"][tf]
-                    label = "1h" if tf == 60 else f"{tf}m"
+                    label = "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
                     twr = d["w"]/d["n"]*100 if d["n"] else 0
                     tf_lines.append(f"  {label}: {d['w']}/{d['n']} ({twr:.0f}%) ${d['pnl']:+.2f}")
                 tg(f"🎰 <b>PAPER LONGSHOT scoreboard</b>\n"
@@ -322,7 +333,7 @@ def engine():
                     if wkey not in open_windows:
                         elapsed = (tf * 60) - secs_left
                         # For hourly, capture whenever first seen (grace is generous)
-                        if elapsed <= OPEN_CAPTURE_GRACE or tf == 60:
+                        if elapsed <= OPEN_CAPTURE_GRACE or tf in (60, 240):
                             open_windows[wkey] = ref
                         else:
                             open_windows[wkey] = None
@@ -361,7 +372,7 @@ def engine():
                     if SEND_EACH:
                         arrow = "⬆️" if direction == "UP" else "⬇️"
                         shares = PAPER_STAKE / (ask / 100.0)
-                        label = "1h" if tf == 60 else f"{tf}m"
+                        label = "4h" if tf == 240 else "1h" if tf == 60 else f"{tf}m"
                         tg(f"🎰 <b>LONGSHOT {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
                            f"{label} {direction}</b>\n"
                            f"ask <b>{ask:.1f}¢</b> ({shares:.0f} sh) · "
@@ -411,7 +422,7 @@ def scorer():
                 emoji = "\u2705" if won else "\u274c"
                 wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
                 tag = "" if graded_by == "settlement" else " \u26a0\ufe0f feed-graded"
-                label = "1h" if s["tf"] == 60 else f"{s['tf']}m"
+                label = "4h" if s["tf"] == 240 else "1h" if s["tf"] == 60 else f"{s['tf']}m"
                 tg(f"{emoji} LONGSHOT {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
                    f"{label} {s['direction']} <b>{result}</b> ${pnl:+.2f} "
                    f"\u00b7 {s['ask']:.1f}\u00a2{tag}\n"
@@ -429,7 +440,8 @@ def main():
     labels = ", ".join("1h" if t == 60 else f"{t}m" for t in TFS)
     tg(f"🎰 <b>PAPER LONGSHOT live</b> — no money\n"
        f"buys 1-5¢ side · 5m: first {ENTRY_FIRST_SECS:.0f}s · "
-       f"15m: first {ENTRY_FIRST_SECS_15M:.0f}s · 1h: first {ENTRY_FIRST_SECS_60M:.0f}s\n"
+       f"15m: first {ENTRY_FIRST_SECS_15M:.0f}s · 1h: first {ENTRY_FIRST_SECS_60M:.0f}s · "
+       f"4h: first {ENTRY_FIRST_SECS_240M:.0f}s\n"
        f"tf={labels} · stake ${PAPER_STAKE:g}\n/stats")
     time.sleep(3)
     probe()
