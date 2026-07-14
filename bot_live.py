@@ -31,6 +31,15 @@ ENTRY_FIRST_SECS_60M = float(os.environ.get("ENTRY_FIRST_SECS_60M", "900"))  # 1
 ENTRY_FIRST_SECS_240M = float(os.environ.get("ENTRY_FIRST_SECS_240M", "3600"))  # 4h: first hour
 OPEN_CAPTURE_GRACE   = float(os.environ.get("OPEN_CAPTURE_GRACE", "3"))
 
+# ── LADDER: sell half each time the bid doubles from the last rung ───────────
+# Only applies to slower timeframes (ladder needs time to play out).
+LADDER_ENABLED   = os.environ.get("LADDER_ENABLED", "true").lower() == "true"
+LADDER_MULT      = float(os.environ.get("LADDER_MULT", "2.0"))   # 2x each rung
+LADDER_SELL_FRAC = float(os.environ.get("LADDER_SELL_FRAC", "0.5"))  # sell half
+LADDER_TFS       = set(int(x) for x in
+                       os.environ.get("LADDER_TFS", "15,60,240").split(","))
+LADDER_POLL_SECS = float(os.environ.get("LADDER_POLL_SECS", "3"))
+
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
@@ -148,6 +157,18 @@ def best_ask_cents(token_id):
         return None
 
 
+def best_bid_cents(token_id):
+    """Best bid in cents — what a seller would receive right now."""
+    try:
+        r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=6)
+        b = r.json()
+        prices = [float(x["price"]) for x in b.get("bids", [])
+                  if float(x.get("size", 0)) > 0]
+        return max(prices) * 100.0 if prices else None
+    except Exception:
+        return None
+
+
 def fetch_polymarket_outcome(asset, tf, open_ts):
     slug = build_slug(asset, tf, open_ts)
     try:
@@ -193,7 +214,8 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, asset TEXT, tf INTEGER,
         direction TEXT, open_ts INTEGER, close_ts INTEGER, secs_left REAL,
         move_pct REAL, ask_cents REAL, open_price REAL, settle_price REAL,
-        result TEXT, pnl REAL)""")
+        result TEXT, pnl REAL, ladder_sold REAL DEFAULT 0, ladder_proceeds REAL DEFAULT 0,
+        hold_pnl REAL)""")
     conn.execute("UPDATE paper SET result='VOID' WHERE result='PENDING'")
     conn.commit()
     conn.close()
@@ -219,6 +241,61 @@ def db_resolve(rid, settle_price, result, pnl):
                  (settle_price, result, pnl, rid))
     conn.commit()
     conn.close()
+
+
+def db_resolve2(rid, settle_price, result, pnl, ladder_sold, ladder_proceeds, hold_pnl):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""UPDATE paper SET settle_price=?, result=?, pnl=?,
+                    ladder_sold=?, ladder_proceeds=?, hold_pnl=? WHERE id=?""",
+                 (settle_price, result, pnl, ladder_sold, ladder_proceeds,
+                  hold_pnl, rid))
+    conn.commit()
+    conn.close()
+
+
+def ladder_monitor():
+    """Watches each open position's bid; each time it reaches the next rung
+    (2x the previous), sells LADDER_SELL_FRAC of remaining shares. Paper only —
+    records proceeds. Runs for LADDER_TFS timeframes."""
+    if not LADDER_ENABLED:
+        return
+    while True:
+        try:
+            time.sleep(LADDER_POLL_SECS)
+            now = time.time()
+            with pending_lock:
+                items = list(pending)
+            for s in items:
+                if s["tf"] not in LADDER_TFS:
+                    continue
+                if now >= s["close_ts"]:
+                    continue
+                if s.get("shares_left", 0) < 1:
+                    continue
+                bid = best_bid_cents(s["token"])
+                if bid is None:
+                    continue
+                # climb rungs: may cross several at once on a fast move
+                sold_any = False
+                while bid >= s["next_rung"] and s["shares_left"] >= 1:
+                    sell_shares = s["shares_left"] * LADDER_SELL_FRAC
+                    proceeds = sell_shares * (bid / 100.0)
+                    s["ladder_proceeds"] += proceeds
+                    s["ladder_sold"] += sell_shares
+                    s["shares_left"] -= sell_shares
+                    s["next_rung"] *= LADDER_MULT
+                    sold_any = True
+                if sold_any:
+                    label = "4h" if s["tf"] == 240 else "1h" if s["tf"] == 60 else f"{s['tf']}m"
+                    tg(f"🪜 <b>LADDER SELL {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
+                       f"{label}</b> bid {bid:.0f}¢ · sold to {s['ladder_sold']:.0f} sh "
+                       f"(${s['ladder_proceeds']:.2f} banked) · {s['shares_left']:.0f} left "
+                       f"· next rung {s['next_rung']:.0f}¢")
+                    log.info(f"[LADDER] {s['asset']} {s['tf']} bid {bid:.0f}¢ "
+                             f"sold_total {s['ladder_sold']:.1f} proceeds "
+                             f"${s['ladder_proceeds']:.2f} left {s['shares_left']:.1f}")
+        except Exception as e:
+            log.error(f"[LADDER] {e}")
 
 
 def db_scoreboard():
@@ -365,10 +442,17 @@ def engine():
                                     secs_left, move, ask, op)
                     fired_count[wkey] = fired_count.get(wkey, 0) + 1
                     with pending_lock:
+                        shares_total = PAPER_STAKE / (ask / 100.0)
                         pending.append({"rid": rid, "asset": asset, "tf": tf,
                                         "direction": direction, "open_ts": open_ts,
                                         "close_ts": close_ts, "open_price": op,
-                                        "ask": ask})
+                                        "ask": ask,
+                                        "token": toks[0] if direction == "UP" else toks[1],
+                                        "shares_total": shares_total,
+                                        "shares_left": shares_total,
+                                        "next_rung": ask * LADDER_MULT,
+                                        "ladder_proceeds": 0.0,
+                                        "ladder_sold": 0.0})
                     if SEND_EACH:
                         arrow = "⬆️" if direction == "UP" else "⬇️"
                         shares = PAPER_STAKE / (ask / 100.0)
@@ -412,10 +496,21 @@ def scorer():
                     outcome = "UP" if settle_px > op else "DOWN"
                     graded_by = "feed-fallback"
                 won = (s["direction"] == outcome)
-                shares = PAPER_STAKE / (s["ask"] / 100.0)
-                pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
+                # HOLD-to-settlement P&L (the baseline we compare against)
+                shares_total = s.get("shares_total", PAPER_STAKE / (s["ask"] / 100.0))
+                hold_pnl = (shares_total * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
+                # LADDER P&L: proceeds already banked from selling on the way up,
+                # PLUS the remaining shares settling (worth $1 each if won, else 0)
+                proceeds = s.get("ladder_proceeds", 0.0)
+                shares_left = s.get("shares_left", shares_total)
+                remaining_settle = (shares_left * 1.0) if won else 0.0
+                ladder_pnl = proceeds + remaining_settle - PAPER_STAKE
+                # if the ladder is on for this tf, ladder_pnl is the real result;
+                # otherwise it equals hold_pnl (no rungs sold)
+                pnl = round(ladder_pnl, 4)
                 result = "WIN" if won else "LOSS"
-                db_resolve(s["rid"], None, result, round(pnl, 4))
+                db_resolve2(s["rid"], None, result, pnl, s.get("ladder_sold", 0.0),
+                            round(proceeds, 4), round(hold_pnl, 4))
                 with pending_lock:
                     s in pending and pending.remove(s)
                 sb = db_scoreboard()
@@ -423,9 +518,14 @@ def scorer():
                 wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
                 tag = "" if graded_by == "settlement" else " \u26a0\ufe0f feed-graded"
                 label = "4h" if s["tf"] == 240 else "1h" if s["tf"] == 60 else f"{s['tf']}m"
+                sold_note = ""
+                if s.get("ladder_sold", 0) > 0:
+                    sold_note = (f"\nladder sold {s['ladder_sold']:.0f} sh for "
+                                 f"${proceeds:.2f} · {shares_left:.0f} rode to settle "
+                                 f"· vs hold ${hold_pnl:+.2f}")
                 tg(f"{emoji} LONGSHOT {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
                    f"{label} {s['direction']} <b>{result}</b> ${pnl:+.2f} "
-                   f"\u00b7 {s['ask']:.1f}\u00a2{tag}\n"
+                   f"\u00b7 {s['ask']:.1f}\u00a2{tag}{sold_note}\n"
                    f"\U0001f3b0 {sb['n']} trades \u00b7 {wr} win \u00b7 P&L ${sb['pnl']:+.2f}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
@@ -447,6 +547,7 @@ def main():
     probe()
     threading.Thread(target=engine, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
+    threading.Thread(target=ladder_monitor, daemon=True).start()
     while True:
         try:
             handle_commands()
