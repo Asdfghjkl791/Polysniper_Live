@@ -34,7 +34,7 @@
 #   MAX_SPREAD_CENTS=100, FEE_RATE=0.07, POLL_SECS=1.5, SETTLE_POLL_SECS=15,
 #   SETTLE_TIMEOUT_SECS=1800, DB_PATH=paper_last_minute.db, STATS_TZ=America/Thunder_Bay
 
-import os, time, json, sqlite3, logging, threading, requests, csv, io
+import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -62,6 +62,11 @@ POLL_SECS           = float(os.environ.get("POLL_SECS", "1.5"))
 SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
 SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "1800"))
 STATS_TZ = ZoneInfo(os.environ.get("STATS_TZ", "America/Thunder_Bay"))
+# Shadow snapshots: at each of these seconds-left checkpoints, record what
+# the leader costs for EVERY coin (no trade). After settlement we know which
+# entry time actually works best. /timing shows it.
+SNAP_SECS = sorted({int(x) for x in os.environ.get(
+    "SNAP_SECS", "180,120,90,60,45,30,15").split(",") if x.strip()}, reverse=True)
 
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
@@ -259,6 +264,11 @@ def init_db():
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass
+    conn.execute("""CREATE TABLE IF NOT EXISTS snaps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, asset TEXT, tf INTEGER,
+        open_ts INTEGER, close_ts INTEGER, cp INTEGER, secs_left REAL,
+        direction TEXT, ask REAL, bid REAL, opp_ask REAL, vwap REAL, shares REAL,
+        stake REAL, fee REAL, result TEXT, pnl_net REAL)""")
     conn.execute("UPDATE trades SET result='VOID' WHERE result='PENDING'")
     conn.commit()
     conn.close()
@@ -359,6 +369,53 @@ def build_csv():
     return buf.getvalue(), len(rows)
 
 
+# ── coin price history (Binance 1-minute candles) for offline analysis ──────
+BINANCE_REST = "https://data-api.binance.vision/api/v3/klines"
+_prices_lock = threading.Lock()
+
+
+def export_prices_worker(days):
+    """1-minute candles for every Binance-listed coin (HYPE isn't on Binance)
+    over the last `days` days -> gzipped CSV sent to Telegram."""
+    if not _prices_lock.acquire(blocking=False):
+        tg("⏳ price export already running", force=True)
+        return
+    try:
+        tg(f"⏳ downloading {days} day(s) of 1-minute coin prices…", force=True)
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - int(days * 86400 * 1000)
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["asset", "t", "open", "high", "low", "close", "volume"])
+        rows = 0
+        for asset in [a for a in BINANCE_SYM_TO_ASSET.values()]:
+            cur = start_ms
+            while cur < end_ms:
+                r = requests.get(BINANCE_REST, params={"symbol": f"{asset}USDT",
+                                 "interval": "1m", "startTime": cur, "limit": 1000},
+                                 timeout=15)
+                k = r.json() if r.status_code == 200 else []
+                if not k:
+                    break
+                for c in k:
+                    w.writerow([asset, int(c[0]) // 1000, c[1], c[2], c[3], c[4], c[5]])
+                rows += len(k)
+                cur = int(k[-1][0]) + 60_000
+                time.sleep(0.2)
+        data = gzip.compress(buf.getvalue().encode())
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                          data={"chat_id": TELEGRAM_CHAT_ID,
+                                "caption": f"{rows} one-minute candles · {days} day(s)"},
+                          files={"document": (f"coin_prices_{days}d.csv.gz", data,
+                                              "application/gzip")}, timeout=300)
+        if r.status_code != 200:
+            tg(f"⚠️ price upload failed ({r.status_code})", force=True)
+    except Exception as e:
+        tg(f"⚠️ price export failed: {e}", force=True)
+    finally:
+        _prices_lock.release()
+
+
 # ── telegram ────────────────────────────────────────────────────────────────
 def tg(msg, force=False):
     if muted and not force:
@@ -425,6 +482,28 @@ def handle_commands():
                     tg_document("lastmin_trades.csv", text, f"{n} trades")
                 else:
                     tg("no trades yet", force=True)
+            elif t == "/timing":
+                tg(timing_text(), force=True)
+            elif t == "/exportsnaps":
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                rs = conn.execute("SELECT * FROM snaps ORDER BY id").fetchall()
+                conn.close()
+                if rs:
+                    buf = io.StringIO()
+                    w = csv.writer(buf)
+                    w.writerow(rs[0].keys())
+                    w.writerows([list(r) for r in rs])
+                    tg_document("lastmin_snaps.csv", buf.getvalue(), f"{len(rs)} snapshots")
+                else:
+                    tg("no snapshots yet", force=True)
+            elif t == "/exportprices":
+                try:
+                    days = max(1, min(30, int(arg))) if arg else 3
+                except ValueError:
+                    days = 3
+                threading.Thread(target=export_prices_worker, args=(days,),
+                                 daemon=True).start()
             elif t == "/mute":
                 muted = True
                 tg("🔇 muted — still trading and recording. /unmute to turn messages back on",
@@ -435,6 +514,9 @@ def handle_commands():
             elif t == "/help":
                 tg("📖 <b>commands</b>\n/stats — today (after fees)\n/stats all — all time\n"
                    "/status — open positions\n/export — all trades as CSV\n"
+                   "/exportprices [days] — 1-minute coin prices (default 3 days)\n"
+                   "/timing — which entry time works best (shadow test)\n"
+                   "/exportsnaps — the timing snapshots as CSV\n"
                    "/mute · /unmute — window messages off/on\n/help — this list",
                    force=True)
     except Exception:
@@ -514,6 +596,106 @@ def track_bids():
         s["min_bid"] = min(s["min_bid"], bk["bid"])
 
 
+snap_done = set()      # (tf, open_ts, cp)
+snap_markets = {}      # (asset, tf, open_ts) -> close_ts, awaiting outcome
+snap_lock = threading.Lock()
+
+
+def take_snapshots(tf, open_ts, close_ts, secs_left, cp):
+    toks = {a: resolve_tokens(a, tf, open_ts) for a in COINS}
+    jobs = {}
+    for a, tk in toks.items():
+        if tk:
+            jobs[a] = (_pool.submit(get_book, tk[0]), _pool.submit(get_book, tk[1]))
+    rows = []
+    for a, (fu, fd) in jobs.items():
+        up, dn = fu.result(), fd.result()
+        if not up or not dn:
+            continue
+        direction, lead, opp = (("UP", up, dn) if (up["bid"] + up["ask"]) >=
+                                (dn["bid"] + dn["ask"]) else ("DOWN", dn, up))
+        fill = vwap_fill(lead["asks"], STAKE)
+        if not fill:
+            continue
+        vwap, shares, spent, _lv = fill
+        rows.append((datetime.now(timezone.utc).isoformat(), a, tf, open_ts, close_ts,
+                     cp, round(secs_left, 1), direction, lead["ask"], lead["bid"],
+                     opp["ask"], round(vwap, 4), round(shares, 6), round(spent, 6),
+                     round(fee_for(shares, vwap / 100.0), 6), "PENDING"))
+    if not rows:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    conn.executemany("""INSERT INTO snaps (created,asset,tf,open_ts,close_ts,cp,secs_left,
+        direction,ask,bid,opp_ask,vwap,shares,stake,fee,result)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+    conn.commit()
+    conn.close()
+    with snap_lock:
+        for r in rows:
+            snap_markets[(r[1], tf, open_ts)] = close_ts
+
+
+def snap_scorer():
+    """Grade every recorded snapshot once its market settles."""
+    while True:
+        try:
+            time.sleep(SETTLE_POLL_SECS)
+            now = time.time()
+            with snap_lock:
+                due = [(k, c) for k, c in snap_markets.items() if now >= c + 2]
+            for (asset, tf, open_ts), close_ts in due:
+                outcome = fetch_polymarket_outcome(asset, tf, open_ts)
+                conn = sqlite3.connect(DB_PATH)
+                if outcome is None:
+                    if now <= close_ts + SETTLE_TIMEOUT_SECS:
+                        conn.close()
+                        continue
+                    conn.execute("""UPDATE snaps SET result='VOID', pnl_net=0
+                                    WHERE asset=? AND tf=? AND open_ts=?""",
+                                 (asset, tf, open_ts))
+                else:
+                    conn.execute("""UPDATE snaps SET
+                        result = CASE WHEN direction=? THEN 'WIN' ELSE 'LOSS' END,
+                        pnl_net = CASE WHEN direction=? THEN shares - stake - fee
+                                       ELSE -stake - fee END
+                        WHERE asset=? AND tf=? AND open_ts=? AND result='PENDING'""",
+                                 (outcome, outcome, asset, tf, open_ts))
+                conn.commit()
+                conn.close()
+                with snap_lock:
+                    snap_markets.pop((asset, tf, open_ts), None)
+        except Exception as e:
+            log.error(f"[SNAPS] {e}")
+
+
+def timing_text():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("""SELECT tf, cp, result, ask, vwap, pnl_net, open_ts FROM snaps
+                           WHERE result IN ('WIN','LOSS') AND ask BETWEEN ? AND ?""",
+                        (MIN_CENTS, MAX_CENTS)).fetchall()
+    conn.close()
+    if not rows:
+        return "⏱ <b>ENTRY TIMING</b>\nno settled snapshots yet"
+    out = {}
+    for tf, cp, res, ask, vwap, net, o in rows:
+        d = out.setdefault((tf, cp), {"n": 0, "w": 0, "px": 0.0, "net": 0.0, "win": set()})
+        d["n"] += 1
+        d["w"] += res == "WIN"
+        d["px"] += vwap
+        d["net"] += net
+        d["win"].add(o)
+    lines = [f"⏱ <b>ENTRY TIMING</b> (shadow, all time · leader {MIN_CENTS:.0f}–"
+             f"{MAX_CENTS:.0f}¢ · $5 · after fees)"]
+    for tf in sorted({k[0] for k in out}):
+        lines.append(f"━━ <b>{label_for(tf)}</b>")
+        for cp in sorted({k[1] for k in out if k[0] == tf}, reverse=True):
+            d = out[(tf, cp)]
+            n = d["n"]
+            lines.append(f"{cp:>3d}s left: {n} · {len(d['win'])} windows · {d['w'] / n * 100:.0f}% won vs "
+                         f"paid {d['px'] / n:.0f}¢ · net {money(d['net'])}")
+    return "\n".join(lines)
+
+
 def monitor():
     while True:
         try:
@@ -528,6 +710,14 @@ def monitor():
                     entered.difference_update([k for k in entered if k[2] < cutoff])
                 if MIN_SECS_LEFT <= secs_left <= ENTRY_SECS_LEFT:
                     try_entries(tf, open_ts, close_ts, secs_left)
+                for cp in SNAP_SECS:
+                    key = (tf, open_ts, cp)
+                    if key not in snap_done and cp - 10 < secs_left <= cp:
+                        snap_done.add(key)
+                        take_snapshots(tf, open_ts, close_ts, secs_left, cp)
+                if len(snap_done) > 5000:
+                    old = time.time() - 6 * 3600
+                    snap_done.difference_update([k for k in snap_done if k[1] < old])
             track_bids()
         except Exception as e:
             log.error(f"[MONITOR] {e}")
@@ -603,6 +793,7 @@ def main():
        f"/stats · /help", force=True)
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
+    threading.Thread(target=snap_scorer, daemon=True).start()
     while True:
         try:
             handle_commands()
