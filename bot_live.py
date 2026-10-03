@@ -30,7 +30,7 @@
 # ENV (required): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (use a DIFFERENT bot token
 #   from the favorite-dip bot — two programs can't share one bot's updates)
 # ENV (optional): STAKE=5, TIMEFRAMES=15, COINS=BTC,ETH,SOL,DOGE,BNB,XRP,HYPE,
-#   ENTRY_SECS_LEFT=90, MIN_SECS_LEFT=5, MIN_CENTS=50, MAX_CENTS=90,
+#   ENTRY_SECS_LEFT=90, MIN_SECS_LEFT=5, MIN_CENTS=50, MAX_CENTS=90, ONE_LOOK=true,
 #   MAX_SPREAD_CENTS=100, FEE_RATE=0.07, POLL_SECS=1.5, SETTLE_POLL_SECS=15,
 #   SETTLE_TIMEOUT_SECS=1800, DB_PATH=paper_last_minute.db, STATS_TZ=America/Thunder_Bay
 
@@ -57,6 +57,10 @@ MIN_SECS_LEFT    = float(os.environ.get("MIN_SECS_LEFT", "5"))
 MIN_CENTS        = float(os.environ.get("MIN_CENTS", "50"))
 MAX_CENTS        = float(os.environ.get("MAX_CENTS", "90"))
 MAX_SPREAD_CENTS = float(os.environ.get("MAX_SPREAD_CENTS", "100"))  # 100 = no filter
+# ONE_LOOK=true: decide ONCE per market at the first check (≈ENTRY_SECS_LEFT).
+# If the leader isn't in the price band right then, skip that market — no
+# buying late wobbles. false = old behaviour (keep checking down to MIN_SECS_LEFT).
+ONE_LOOK = os.environ.get("ONE_LOOK", "true").strip().lower() in ("1", "true", "yes", "on")
 FEE_RATE         = float(os.environ.get("FEE_RATE", "0.07"))
 POLL_SECS           = float(os.environ.get("POLL_SECS", "1.5"))
 SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
@@ -524,7 +528,7 @@ def handle_commands():
 
 
 # ── trading loop ────────────────────────────────────────────────────────────
-entered = set()       # (asset, tf, open_ts)
+entered = set()       # (asset, tf, open_ts)  — bought, or already looked (ONE_LOOK)
 open_ref = {}         # (tf, open_ts) -> {asset: ref price at window start}
 pending = []
 pending_lock = threading.Lock()
@@ -547,13 +551,15 @@ def try_entries(tf, open_ts, close_ts, secs_left):
             continue
         up, dn = jobs[(a, "UP")].result(), jobs[(a, "DOWN")].result()
         if not up or not dn:
-            continue
+            continue          # no book yet — try again next poll
+        if ONE_LOOK:
+            entered.add((a, tf, open_ts))   # this is our one look at this market
         mid_up = (up["bid"] + up["ask"]) / 2
         mid_dn = (dn["bid"] + dn["ask"]) / 2
         direction, lead, opp, tok = (("UP", up, dn, tk[0]) if mid_up >= mid_dn
                                      else ("DOWN", dn, up, tk[1]))
         if not (MIN_CENTS <= lead["ask"] <= MAX_CENTS):
-            continue          # keep watching — it may move into the band
+            continue          # ONE_LOOK: skip this market · else keep watching
         if lead["ask"] - lead["bid"] > MAX_SPREAD_CENTS:
             continue
         fill = vwap_fill(lead["asks"], STAKE)
@@ -786,8 +792,9 @@ def main():
     init_db()
     threading.Thread(target=binance_ref_worker, daemon=True).start()
     tg(f"⏱ <b>LAST-MINUTE LEADER · PAPER</b> — no money\n"
-       f"buys the leading side in the last {ENTRY_SECS_LEFT:.0f}s if its ask is "
-       f"{MIN_CENTS:.0f}–{MAX_CENTS:.0f}¢ · holds to settle\n"
+       + (f"one look at {ENTRY_SECS_LEFT:.0f}s left: buys the leader if its ask is "
+          if ONE_LOOK else f"buys the leading side in the last {ENTRY_SECS_LEFT:.0f}s if its ask is ")
+       + f"{MIN_CENTS:.0f}–{MAX_CENTS:.0f}¢ · holds to settle\n"
        f"fills walk the real book · {FEE_RATE:.0%} taker-fee formula applied\n"
        f"tf={','.join(label_for(t) for t in TFS)} · {len(COINS)} coins · ${STAKE:g}/trade\n"
        f"/stats · /help", force=True)
