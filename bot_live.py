@@ -72,6 +72,19 @@ STATS_TZ = ZoneInfo(os.environ.get("STATS_TZ", "America/Thunder_Bay"))
 SNAP_SECS = sorted({int(x) for x in os.environ.get(
     "SNAP_SECS", "180,120,90,60,45,30,15").split(",") if x.strip()}, reverse=True)
 
+# TRAILING-SIDE test (second paper strategy, separate table + /trailstats):
+# with TRAIL_SECS_LEFT left, take ONE look at each market; if the side that is
+# BEHIND costs TRAIL_MIN..TRAIL_MAX cents, paper-buy $STAKE of it (real book
+# fill, real fee) and hold to settlement. Snapshot data (Oct 2-4) showed the
+# trailing side at ~2 min left winning more often than its price.
+TRAIL_ENABLED   = os.environ.get("TRAIL_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+TRAIL_SECS_LEFT = float(os.environ.get("TRAIL_SECS_LEFT", "120"))
+TRAIL_MIN_CENTS = float(os.environ.get("TRAIL_MIN_CENTS", "10"))
+TRAIL_MAX_CENTS = float(os.environ.get("TRAIL_MAX_CENTS", "50"))
+TRAIL_TFS = [int(x) for x in os.environ.get("TRAIL_TIMEFRAMES", "15").split(",") if x.strip()]
+TRAIL_COINS = [c.strip().upper() for c in
+               os.environ.get("TRAIL_COINS", "BTC,ETH,SOL,DOGE,BNB,XRP").split(",") if c.strip()]
+
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
 ASSET_FULLNAME = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
@@ -263,6 +276,8 @@ COLS = """id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, asset TEXT, tf INT
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute(f"CREATE TABLE IF NOT EXISTS trades ({COLS})")
+    conn.execute(f"CREATE TABLE IF NOT EXISTS trail ({COLS})")
+    conn.execute("UPDATE trail SET result='VOID' WHERE result='PENDING'")
     for col in ("peak_bid_after REAL", "min_bid_after REAL"):
         try:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
@@ -278,11 +293,11 @@ def init_db():
     conn.close()
 
 
-def db_insert(row):
+def db_insert(row, table="trades"):
     conn = sqlite3.connect(DB_PATH)
     keys = list(row.keys())
     c = conn.cursor()
-    c.execute(f"INSERT INTO trades ({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
+    c.execute(f"INSERT INTO {table} ({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
               [row[k] for k in keys])
     rid = c.lastrowid
     conn.commit()
@@ -290,9 +305,10 @@ def db_insert(row):
     return rid
 
 
-def db_resolve(rid, result, graded_by, pnl_hold, pnl_net, peak=None, low=None):
+def db_resolve(rid, result, graded_by, pnl_hold, pnl_net, peak=None, low=None,
+               table="trades"):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""UPDATE trades SET result=?, graded_by=?, pnl_hold=?, pnl_net=?,
+    conn.execute(f"""UPDATE {table} SET result=?, graded_by=?, pnl_hold=?, pnl_net=?,
                     peak_bid_after=?, min_bid_after=? WHERE id=?""",
                  (result, graded_by, pnl_hold, pnl_net, peak, low, rid))
     conn.commit()
@@ -306,10 +322,10 @@ def _since(mode):
     return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
-def db_rows(since_ts=None):
+def db_rows(since_ts=None, table="trades"):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM trades WHERE result IN ('WIN','LOSS')").fetchall()
+    rows = conn.execute(f"SELECT * FROM {table} WHERE result IN ('WIN','LOSS')").fetchall()
     conn.close()
     if since_ts is not None:
         rows = [r for r in rows
@@ -317,10 +333,11 @@ def db_rows(since_ts=None):
     return rows
 
 
-def stats_text(mode="today"):
-    rows = db_rows(_since(mode))
+def stats_text(mode="today", table="trades"):
+    rows = db_rows(_since(mode), table)
     scope = "all time" if mode == "all" else "today"
-    head = f"⏱ <b>LAST-MINUTE · PAPER</b> · {scope}"
+    head = (f"⏱ <b>LAST-MINUTE · PAPER</b> · {scope}" if table == "trades" else
+            f"🔁 <b>TRAILING SIDE @{TRAIL_SECS_LEFT:.0f}s · PAPER</b> · {scope}")
     if not rows:
         return f"{head}\nno settled trades yet"
     n = len(rows)
@@ -344,13 +361,15 @@ def stats_text(mode="today"):
                      f"net {money(sum(r['pnl_net'] or 0 for r in rs))} "
                      f"({sum(r['pnl_net'] or 0 for r in rs) / k / STAKE * 100:+.1f}%/trade)")
     lines.append("━━━━━━━━━━")
-    for lo, hi in ((50, 60), (60, 70), (70, 80), (80, 90.01)):
+    bands = (((50, 60), (60, 70), (70, 80), (80, 90.01)) if table == "trades" else
+             ((0, 20), (20, 30), (30, 40), (40, 50.01)))
+    for lo, hi in bands:
         rs = [r for r in rows if lo <= r["ask"] < hi]
         if rs:
             k = len(rs)
             wr = sum(1 for r in rs if r["result"] == "WIN") / k * 100
             avg = sum(r["vwap"] for r in rs) / k
-            lines.append(f"{lo}s: {k} · won {wr:.0f}% vs paid {avg:.0f}¢ · "
+            lines.append(f"{(str(lo) + 's') if table == 'trades' else (str(lo) + '–' + str(int(hi)) + '¢')}: {k} · won {wr:.0f}% vs paid {avg:.0f}¢ · "
                          f"net {money(sum(r['pnl_net'] or 0 for r in rs))}")
     slip = sum((r["vwap"] - r["ask"]) for r in rows) / n
     spr = sum((r["ask"] - r["bid"]) for r in rows) / n
@@ -358,10 +377,10 @@ def stats_text(mode="today"):
     return "\n".join(lines)
 
 
-def build_csv():
+def build_csv(table="trades"):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM trades ORDER BY id").fetchall()
+    rows = conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
     conn.close()
     if not rows:
         return None, 0
@@ -486,6 +505,14 @@ def handle_commands():
                     tg_document("lastmin_trades.csv", text, f"{n} trades")
                 else:
                     tg("no trades yet", force=True)
+            elif t == "/trailstats":
+                tg(stats_text("all" if arg == "all" else "today", "trail"), force=True)
+            elif t == "/exporttrail":
+                text, n = build_csv("trail")
+                if text:
+                    tg_document("trail_trades.csv", text, f"{n} trailing-side trades")
+                else:
+                    tg("no trailing-side trades yet", force=True)
             elif t == "/timing":
                 tg(timing_text(), force=True)
             elif t == "/exportsnaps":
@@ -521,6 +548,8 @@ def handle_commands():
                    "/exportprices [days] — 1-minute coin prices (default 3 days)\n"
                    "/timing — which entry time works best (shadow test)\n"
                    "/exportsnaps — the timing snapshots as CSV\n"
+                   "/trailstats [all] — trailing-side test (buys the side BEHIND at ~2 min left)\n"
+                   "/exporttrail — trailing-side trades as CSV\n"
                    "/mute · /unmute — window messages off/on\n/help — this list",
                    force=True)
     except Exception:
@@ -583,6 +612,46 @@ def try_entries(tf, open_ts, close_ts, secs_left):
                                 peak_bid=lead["bid"], min_bid=lead["bid"]))
         log.info(f"[ENTRY] {a} {label_for(tf)} {direction} vwap {vwap:.2f}c "
                  f"(ask {lead['ask']:.0f}) {secs_left:.0f}s left fee ${fee:.3f}")
+
+
+trail_done = set()     # (tf, open_ts) — one look per window
+
+
+def try_trail(tf, open_ts, close_ts, secs_left):
+    """One look per market: buy the side that is BEHIND if it costs TRAIL_MIN..MAX."""
+    toks = {a: resolve_tokens(a, tf, open_ts) for a in TRAIL_COINS}
+    jobs = {a: (_pool.submit(get_book, tk[0]), _pool.submit(get_book, tk[1]))
+            for a, tk in toks.items() if tk}
+    for a, (fu, fd) in jobs.items():
+        up, dn = fu.result(), fd.result()
+        if not up or not dn:
+            continue
+        tk = toks[a]
+        lead_up = (up["bid"] + up["ask"]) >= (dn["bid"] + dn["ask"])
+        direction, trail, lead, tok = (("DOWN", dn, up, tk[1]) if lead_up
+                                       else ("UP", up, dn, tk[0]))
+        if not (TRAIL_MIN_CENTS <= trail["ask"] <= TRAIL_MAX_CENTS):
+            continue
+        fill = vwap_fill(trail["asks"], STAKE)
+        if not fill:
+            continue
+        vwap, shares, spent, levels = fill
+        fee = fee_for(shares, vwap / 100.0)
+        row = dict(created=datetime.now(timezone.utc).isoformat(), asset=a, tf=tf,
+                   direction=direction, open_ts=open_ts, close_ts=close_ts,
+                   secs_left=round(secs_left, 1), ask=trail["ask"], bid=trail["bid"],
+                   mid=(trail["ask"] + trail["bid"]) / 2, opp_ask=lead["ask"],
+                   opp_bid=lead["bid"], vwap=round(vwap, 4), shares=round(shares, 6),
+                   stake=round(spent, 6), fee=round(fee, 6), levels=levels,
+                   top_size=trail["asks"][0][1], partial=int(spent < STAKE - 1e-6),
+                   ref_open=open_ref.get((tf, open_ts), {}).get(a),
+                   ref_entry=prices_ref.get(a), result="PENDING")
+        rid = db_insert(row, "trail")
+        with pending_lock:
+            pending.append(dict(row, rid=rid, token=tok, table="trail",
+                                peak_bid=trail["bid"], min_bid=trail["bid"]))
+        log.info(f"[TRAIL] {a} {label_for(tf)} {direction} vwap {vwap:.2f}c "
+                 f"{secs_left:.0f}s left fee ${fee:.3f}")
 
 
 def track_bids():
@@ -706,7 +775,7 @@ def monitor():
     while True:
         try:
             time.sleep(POLL_SECS)
-            for tf in TFS:
+            for tf in sorted(set(TFS) | (set(TRAIL_TFS) if TRAIL_ENABLED else set())):
                 open_ts, close_ts, secs_left = window_times(tf)
                 if (tf, open_ts) not in open_ref:
                     open_ref[(tf, open_ts)] = dict(prices_ref)
@@ -714,9 +783,14 @@ def monitor():
                     for k in [k for k in open_ref if k[1] < cutoff]:
                         del open_ref[k]
                     entered.difference_update([k for k in entered if k[2] < cutoff])
-                if MIN_SECS_LEFT <= secs_left <= ENTRY_SECS_LEFT:
+                    trail_done.difference_update([k for k in trail_done if k[1] < cutoff])
+                if tf in TFS and MIN_SECS_LEFT <= secs_left <= ENTRY_SECS_LEFT:
                     try_entries(tf, open_ts, close_ts, secs_left)
-                for cp in SNAP_SECS:
+                if (TRAIL_ENABLED and tf in TRAIL_TFS and (tf, open_ts) not in trail_done
+                        and TRAIL_SECS_LEFT - 10 < secs_left <= TRAIL_SECS_LEFT):
+                    trail_done.add((tf, open_ts))
+                    try_trail(tf, open_ts, close_ts, secs_left)
+                for cp in (SNAP_SECS if tf in TFS else []):
                     key = (tf, open_ts, cp)
                     if key not in snap_done and cp - 10 < secs_left <= cp:
                         snap_done.add(key)
@@ -763,7 +837,8 @@ def scorer():
                     op, px = s.get("ref_open"), prices_ref.get(s["asset"])
                     if op is None or px is None or abs((px - op) / op) < 1e-6:
                         db_resolve(s["rid"], "VOID", "none", 0, 0,
-                                   s.get("peak_bid"), s.get("min_bid"))
+                                   s.get("peak_bid"), s.get("min_bid"),
+                                   s.get("table", "trades"))
                         with pending_lock:
                             s in pending and pending.remove(s)
                         continue
@@ -774,12 +849,13 @@ def scorer():
                 net = hold - s["fee"]
                 db_resolve(s["rid"], "WIN" if won else "LOSS", graded,
                            round(hold, 6), round(net, 6),
-                           s.get("peak_bid"), s.get("min_bid"))
+                           s.get("peak_bid"), s.get("min_bid"),
+                           s.get("table", "trades"))
                 with pending_lock:
                     s in pending and pending.remove(s)
                     left = any(p["tf"] == s["tf"] and p["open_ts"] == s["open_ts"]
-                               for p in pending)
-                if not left:
+                               and p.get("table", "trades") == "trades" for p in pending)
+                if not left and s.get("table", "trades") == "trades":
                     window_summary(s["tf"], s["open_ts"])
         except Exception as e:
             log.error(f"[SCORER] {e}")
@@ -797,7 +873,10 @@ def main():
        + f"{MIN_CENTS:.0f}–{MAX_CENTS:.0f}¢ · holds to settle\n"
        f"fills walk the real book · {FEE_RATE:.0%} taker-fee formula applied\n"
        f"tf={','.join(label_for(t) for t in TFS)} · {len(COINS)} coins · ${STAKE:g}/trade\n"
-       f"/stats · /help", force=True)
+       + (f"🔁 trailing-side test ON: {TRAIL_SECS_LEFT:.0f}s left · behind side "
+          f"{TRAIL_MIN_CENTS:.0f}–{TRAIL_MAX_CENTS:.0f}¢ · {len(TRAIL_COINS)} coins · /trailstats\n"
+          if TRAIL_ENABLED else "")
+       + "/stats · /help", force=True)
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
     threading.Thread(target=snap_scorer, daemon=True).start()
