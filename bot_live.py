@@ -36,7 +36,7 @@
 
 import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 try:
     import websocket
@@ -81,6 +81,8 @@ TRAIL_ENABLED   = os.environ.get("TRAIL_ENABLED", "true").strip().lower() in ("1
 TRAIL_SECS_LEFT = float(os.environ.get("TRAIL_SECS_LEFT", "120"))
 TRAIL_MIN_CENTS = float(os.environ.get("TRAIL_MIN_CENTS", "10"))
 TRAIL_MAX_CENTS = float(os.environ.get("TRAIL_MAX_CENTS", "50"))
+# skip a trailing-side buy when that side's book is wider than this (cents)
+TRAIL_MAX_SPREAD_CENTS = float(os.environ.get("TRAIL_MAX_SPREAD_CENTS", "8"))
 TRAIL_TFS = [int(x) for x in os.environ.get("TRAIL_TIMEFRAMES", "15").split(",") if x.strip()]
 TRAIL_COINS = [c.strip().upper() for c in
                os.environ.get("TRAIL_COINS", "BTC,ETH,SOL,DOGE,BNB,XRP").split(",") if c.strip()]
@@ -466,6 +468,239 @@ def tg_document(filename, text, caption=""):
         tg(f"⚠️ upload failed: {e}", force=True)
 
 
+# ── /backtest: replay old 5m markets from Polymarket's real trade history ────
+# Tests the 5m 9–13¢ early-buy setup on past days. For every 5m market of a day it
+# pulls the market's actual trades and finds the first moment (first BT_SECS)
+# a side could be BOUGHT at BT_LO..BT_HI¢:
+#   - someone bought that side at p    -> its ask was p
+#   - someone sold the other side at q -> this side's ask was about 100-q
+# then grades it with the real result. One buy per market, fees applied.
+# Runs in the background; does not touch the live trading.
+DATA_BASE = "https://data-api.polymarket.com"
+BT_LO   = float(os.environ.get("BT_LO", "9"))
+BT_HI   = float(os.environ.get("BT_HI", "13"))
+BT_SECS = float(os.environ.get("BT_SECS", "60"))          # recorded window
+BT_REPORT_SECS = float(os.environ.get("BT_REPORT_SECS", "45"))
+BT_WORKERS = int(os.environ.get("BT_WORKERS", "6"))
+BT_COINS = [c.strip().upper() for c in
+            os.environ.get("BT_COINS", "BTC,ETH,SOL,DOGE,BNB,XRP,HYPE").split(",") if c.strip()]
+bt_running = False
+
+
+def bt_sql(sql, args=(), many=False, fetch=False):
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.executemany(sql, args) if many else conn.execute(sql, args)
+        rows = cur.fetchall() if fetch else None
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def bt_init():
+    bt_sql("""CREATE TABLE IF NOT EXISTS bt (
+        asset TEXT, tf INTEGER, open_ts INTEGER, outcome TEXT, ntrades INTEGER,
+        hit_secs REAL, side TEXT, px REAL, src TEXT, size REAL, min_up REAL,
+        min_dn REAL, status TEXT, PRIMARY KEY (asset, tf, open_ts))""")
+
+
+def bt_get(url, params, tries=4):
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(1.5 * (i + 1))
+                continue
+            return None
+        except Exception:
+            time.sleep(1.5 * (i + 1))
+    return None
+
+
+def bt_market(asset, open_ts):
+    """-> dict(cond, up, dn, outcome) or None"""
+    arr = bt_get(f"{GAMMA_BASE}/events", {"slug": build_slug(asset, 5, open_ts)})
+    ev = arr[0] if isinstance(arr, list) and arr else None
+    mk = (ev or {}).get("markets") or []
+    if not mk:
+        return None
+    m = mk[0]
+    try:
+        toks = json.loads(m.get("clobTokenIds", "[]"))
+        op = m.get("outcomePrices")
+        op = json.loads(op) if isinstance(op, str) else op
+        up_p, dn_p = float(op[0]), float(op[1])
+    except Exception:
+        return None
+    outcome = "UP" if up_p >= 0.99 else "DOWN" if dn_p >= 0.99 else None
+    return {"cond": m.get("conditionId"), "up": str(toks[0]) if toks else None,
+            "dn": str(toks[1]) if len(toks) > 1 else None, "outcome": outcome}
+
+
+def bt_trades(cond, open_ts):
+    """taker trades in the first BT_SECS of the market, oldest first"""
+    out, offset, lim = [], 0, 500
+    while offset <= 20000:
+        page = bt_get(f"{DATA_BASE}/trades", {"market": cond, "limit": lim,
+                                              "offset": offset, "takerOnly": "true"})
+        if not isinstance(page, list) or not page:
+            break
+        stamps = []
+        for t in page:
+            try:
+                ts = float(t.get("timestamp", 0))
+            except Exception:
+                continue
+            stamps.append(ts)
+            if open_ts <= ts <= open_ts + BT_SECS:
+                out.append(t)
+        if len(page) < lim or (stamps and min(stamps) < open_ts):
+            break
+        offset += lim
+    out.sort(key=lambda t: float(t.get("timestamp", 0)))
+    return out
+
+
+def bt_one(asset, open_ts):
+    try:
+        m = bt_market(asset, open_ts)
+        if not m or not m["cond"]:
+            return (asset, 5, open_ts, None, 0, None, None, None, None, None, None, None,
+                    "nomarket")
+        trs = bt_trades(m["cond"], open_ts)
+        hit = None
+        mins = {"UP": None, "DOWN": None}
+        for t in trs:
+            try:
+                p = float(t["price"]) * 100.0
+                sz = float(t.get("size", 0) or 0)
+                ts = float(t["timestamp"])
+            except Exception:
+                continue
+            tok = str(t.get("asset", ""))
+            side_of = ("UP" if tok == m["up"] else "DOWN" if tok == m["dn"] else
+                       ("UP" if str(t.get("outcomeIndex")) == "0" else "DOWN"))
+            other = "DOWN" if side_of == "UP" else "UP"
+            if str(t.get("side", "")).upper() == "BUY":
+                s, ask, src = side_of, p, "buy"
+            else:
+                s, ask, src = other, 100.0 - p, "sell"
+            ask = round(ask, 2)
+            if ts - open_ts <= BT_REPORT_SECS and (mins[s] is None or ask < mins[s]):
+                mins[s] = ask
+            if hit is None and BT_LO <= ask <= BT_HI:
+                hit = (round(ts - open_ts, 1), s, ask, src, sz)
+        st = "ok" if m["outcome"] else "unresolved"
+        h = hit or (None, None, None, None, None)
+        return (asset, 5, open_ts, m["outcome"], len(trs), *h, mins["UP"], mins["DOWN"], st)
+    except Exception as e:
+        log.warning(f"[BT] {asset} {open_ts}: {e}")
+        return (asset, 5, open_ts, None, 0, None, None, None, None, None, None, None, "error")
+
+
+def bt_day_opens(day):
+    d0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=STATS_TZ)
+    start = int(d0.timestamp())
+    return [start + 300 * i for i in range(288)]
+
+
+def bt_summary(rows, extra_cents=0.0):
+    res = {"all": [0, 0, 0.0], "nobnb": [0, 0, 0.0]}
+    for r in rows:
+        if r["hit_secs"] is None or r["hit_secs"] > BT_REPORT_SECS or not r["outcome"]:
+            continue
+        p = (r["px"] + extra_cents) / 100.0
+        sh = STAKE / p
+        win = r["side"] == r["outcome"]
+        net = (sh - STAKE if win else -STAKE) - fee_for(sh, p)
+        for k in ("all", "nobnb"):
+            if k == "nobnb" and r["asset"] == "BNB":
+                continue
+            res[k][0] += 1
+            res[k][1] += int(win)
+            res[k][2] += net
+    return res
+
+
+def bt_run(days):
+    global bt_running
+    try:
+        bt_init()
+        lines = []
+        for day in days:
+            opens = [o for o in bt_day_opens(day) if o + 300 < time.time()]
+            if not opens:
+                continue
+            done = {(r["asset"], r["open_ts"]) for r in bt_sql(
+                "SELECT asset, open_ts FROM bt WHERE tf=5 AND status='ok' "
+                "AND open_ts>=? AND open_ts<=?", (opens[0], opens[-1]), fetch=True)}
+            jobs = [(a, o) for o in opens for a in BT_COINS if (a, o) not in done]
+            t0 = time.time()
+            with ThreadPoolExecutor(max_workers=BT_WORKERS) as ex:
+                got = list(ex.map(lambda j: bt_one(*j), jobs))
+            if got:
+                bt_sql("INSERT OR REPLACE INTO bt VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       got, many=True)
+            rows = bt_sql("SELECT * FROM bt WHERE tf=5 AND open_ts>=? AND open_ts<=?",
+                          (opens[0], opens[-1]), fetch=True)
+            ok = sum(1 for r in rows if r["status"] == "ok")
+            s0, s1 = bt_summary(rows), bt_summary(rows, 1.0)
+            a, nb, nb1 = s0["all"], s0["nobnb"], s1["nobnb"]
+            line = (f"<b>{day}</b> · {ok} mkts\n"
+                    f"  no BNB: {nb[0]} trades · {nb[1]} wins · <b>{money(nb[2])}</b> "
+                    f"(1¢ worse fills {money(nb1[2])})\n"
+                    f"  all coins: {a[0]} · {a[1]} wins · {money(a[2])}")
+            lines.append(line)
+            tg(f"🧪 {line}\n  ({time.time() - t0:.0f}s)", force=True)
+        tg("🧪 <b>BACKTEST done</b> · 5m {:g}–{:g}¢ · first {:g}s · ${:g}/trade · after fees\n\n"
+           .format(BT_LO, BT_HI, BT_REPORT_SECS, STAKE) + "\n".join(lines) +
+           "\n\n/exportbt for the file", force=True)
+    except Exception as e:
+        tg(f"⚠️ backtest failed: {e}", force=True)
+    finally:
+        bt_running = False
+
+
+def bt_start(args):
+    global bt_running
+    if bt_running:
+        tg("🧪 a backtest is already running", force=True)
+        return
+    try:
+        d1 = datetime.strptime(args[0], "%Y-%m-%d").date()
+        d2 = datetime.strptime(args[1], "%Y-%m-%d").date() if len(args) > 1 else d1
+    except Exception:
+        tg("usage: <code>/backtest 2026-10-04</code> or "
+           "<code>/backtest 2026-09-20 2026-10-05</code>", force=True)
+        return
+    if d2 < d1 or (d2 - d1).days > 30:
+        tg("pick up to 31 days, start date first", force=True)
+        return
+    days = [(d1 + timedelta(days=i)).isoformat() for i in range((d2 - d1).days + 1)]
+    bt_running = True
+    tg(f"🧪 backtest started: {len(days)} day(s) · 5m {BT_LO:g}–{BT_HI:g}¢ · "
+       f"first {BT_REPORT_SECS:g}s · a few minutes per day · live bot keeps running",
+       force=True)
+    threading.Thread(target=bt_run, args=(days,), daemon=True).start()
+
+
+def bt_export():
+    bt_init()
+    rs = bt_sql("SELECT * FROM bt ORDER BY open_ts, asset", fetch=True)
+    if not rs:
+        tg("no backtest data yet — try /backtest 2026-10-04", force=True)
+        return
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(rs[0].keys())
+    w.writerows([list(r) for r in rs])
+    tg_document("lastmin_backtest.csv", buf.getvalue(), f"{len(rs)} markets")
+
+
 _upd = None
 
 def handle_commands():
@@ -535,6 +770,10 @@ def handle_commands():
                     days = 3
                 threading.Thread(target=export_prices_worker, args=(days,),
                                  daemon=True).start()
+            elif t == "/backtest":
+                bt_start(parts[1:])
+            elif t == "/exportbt":
+                bt_export()
             elif t == "/mute":
                 muted = True
                 tg("🔇 muted — still trading and recording. /unmute to turn messages back on",
@@ -550,6 +789,8 @@ def handle_commands():
                    "/exportsnaps — the timing snapshots as CSV\n"
                    "/trailstats [all] — trailing-side test (buys the side BEHIND at ~2 min left)\n"
                    "/exporttrail — trailing-side trades as CSV\n"
+                   "/backtest 2026-10-04 [2026-10-05] — replay 5m 9–13¢ from real trade history\n"
+                   "/exportbt — backtest results as CSV\n"
                    "/mute · /unmute — window messages off/on\n/help — this list",
                    force=True)
     except Exception:
@@ -631,6 +872,9 @@ def try_trail(tf, open_ts, close_ts, secs_left):
         direction, trail, lead, tok = (("DOWN", dn, up, tk[1]) if lead_up
                                        else ("UP", up, dn, tk[0]))
         if not (TRAIL_MIN_CENTS <= trail["ask"] <= TRAIL_MAX_CENTS):
+            continue
+        if trail["ask"] - trail["bid"] > TRAIL_MAX_SPREAD_CENTS:
+            log.info(f"[TRAIL] skip {a}: spread {trail['ask'] - trail['bid']:.1f}c")
             continue
         fill = vwap_fill(trail["asks"], STAKE)
         if not fill:
@@ -874,7 +1118,8 @@ def main():
        f"fills walk the real book · {FEE_RATE:.0%} taker-fee formula applied\n"
        f"tf={','.join(label_for(t) for t in TFS)} · {len(COINS)} coins · ${STAKE:g}/trade\n"
        + (f"🔁 trailing-side test ON: {TRAIL_SECS_LEFT:.0f}s left · behind side "
-          f"{TRAIL_MIN_CENTS:.0f}–{TRAIL_MAX_CENTS:.0f}¢ · {len(TRAIL_COINS)} coins · /trailstats\n"
+          f"{TRAIL_MIN_CENTS:.0f}–{TRAIL_MAX_CENTS:.0f}¢ · spread ≤{TRAIL_MAX_SPREAD_CENTS:.0f}¢ · "
+          f"{len(TRAIL_COINS)} coins · /trailstats\n"
           if TRAIL_ENABLED else "")
        + "/stats · /help", force=True)
     threading.Thread(target=monitor, daemon=True).start()
