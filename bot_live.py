@@ -701,6 +701,131 @@ def bt_export():
     tg_document("lastmin_backtest.csv", buf.getvalue(), f"{len(rs)} markets")
 
 
+# ── 5m depth recorder (side test for the 5m 9–13¢ longshot idea) ──────────────
+# Every DEPTH_STEP seconds in the first DEPTH_UNTIL seconds of each 5m market,
+# saves the FULL ask book of the cheap side (when its ask <= DEPTH_MAX_CENTS) and
+# what $1/$2/$3/$5/$10/$20/$50 would really cost. Records only — never trades.
+DEPTH_ENABLED  = os.environ.get("DEPTH_ENABLED", "true").lower() in ("1", "true", "yes")
+DEPTH_COINS    = [c.strip().upper() for c in
+                  os.environ.get("DEPTH_COINS", "BTC,ETH,SOL,DOGE,BNB,XRP,HYPE").split(",") if c.strip()]
+DEPTH_MAX_CENTS = float(os.environ.get("DEPTH_MAX_CENTS", "25"))
+DEPTH_STEP     = int(os.environ.get("DEPTH_STEP", "10"))
+DEPTH_UNTIL    = int(os.environ.get("DEPTH_UNTIL", "60"))
+DEPTH_STAKES   = [1, 2, 3, 5, 10, 20, 50]
+depth_done = set()
+
+
+def depth_init():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("""CREATE TABLE IF NOT EXISTS depth5 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, asset TEXT, open_ts INTEGER,
+        secs_into REAL, side TEXT, ask REAL, bid REAL, opp_ask REAL, opp_bid REAL,
+        sh_1c REAL, sh_2c REAL, sh_5c REAL, book_shares REAL,
+        v1 REAL, v2 REAL, v3 REAL, v5 REAL, v10 REAL, v20 REAL, v50 REAL,
+        asks TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS depth5_mkts (
+        asset TEXT, open_ts INTEGER, outcome TEXT, PRIMARY KEY (asset, open_ts))""")
+    conn.commit()
+    conn.close()
+
+
+def depth_one(asset, open_ts, secs_into):
+    tk = resolve_tokens(asset, 5, open_ts)
+    if not tk:
+        return None
+    up, dn = get_book(tk[0]), get_book(tk[1])
+    if not up or not dn:
+        return None
+    side, bk, ot = ("UP", up, dn) if up["ask"] <= dn["ask"] else ("DOWN", dn, up)
+    if bk["ask"] > DEPTH_MAX_CENTS:
+        return None
+    a0 = bk["ask"]
+    vw = []
+    for st in DEPTH_STAKES:
+        f = vwap_fill(bk["asks"], st)
+        # None if the whole book can't fill this stake
+        vw.append(round(f[0], 4) if f and f[2] >= st - 1e-6 else None)
+    lv = [(round(p, 2), round(s, 2)) for p, s in bk["asks"] if p <= a0 + 30][:60]
+    return (time.time(), asset, open_ts, round(secs_into, 1), side, a0, bk["bid"],
+            ot["ask"], ot["bid"],
+            round(sum(s for p, s in bk["asks"] if p <= a0 + 1), 1),
+            round(sum(s for p, s in bk["asks"] if p <= a0 + 2), 1),
+            round(sum(s for p, s in bk["asks"] if p <= a0 + 5), 1),
+            round(sum(s for p, s in bk["asks"]), 1), *vw, json.dumps(lv))
+
+
+def depth_worker():
+    depth_init()
+    last_grade = 0
+    while True:
+        try:
+            time.sleep(1)
+            now = time.time()
+            o = int(now // 300) * 300
+            into = now - o
+            step = int(into // DEPTH_STEP) * DEPTH_STEP
+            if into <= DEPTH_UNTIL + 2 and (o, step) not in depth_done:
+                depth_done.add((o, step))
+                futs = [_pool.submit(depth_one, a, o, into) for a in DEPTH_COINS]
+                rows = [r for r in (f.result() for f in futs) if r]
+                if rows:
+                    conn = sqlite3.connect(DB_PATH, timeout=30)
+                    conn.executemany(f"INSERT INTO depth5 (ts,asset,open_ts,secs_into,side,ask,bid,"
+                                     f"opp_ask,opp_bid,sh_1c,sh_2c,sh_5c,book_shares,v1,v2,v3,v5,"
+                                     f"v10,v20,v50,asks) VALUES ({','.join('?' * 21)})", rows)
+                    conn.commit()
+                    conn.close()
+            if len(depth_done) > 2000:
+                depth_done.clear()
+            if now - last_grade > 60:
+                last_grade = now
+                conn = sqlite3.connect(DB_PATH, timeout=30)
+                todo = conn.execute("""SELECT DISTINCT d.asset, d.open_ts FROM depth5 d
+                    LEFT JOIN depth5_mkts m ON m.asset=d.asset AND m.open_ts=d.open_ts
+                    WHERE m.outcome IS NULL AND d.open_ts < ? AND d.open_ts > ?""",
+                    (now - 360, now - 86400 * 3)).fetchall()
+                conn.close()
+                got = []
+                for a, ot in todo[:60]:
+                    res = fetch_polymarket_outcome(a, 5, ot)
+                    if res:
+                        got.append((a, ot, res))
+                if got:
+                    conn = sqlite3.connect(DB_PATH, timeout=30)
+                    conn.executemany("INSERT OR REPLACE INTO depth5_mkts VALUES (?,?,?)", got)
+                    conn.commit()
+                    conn.close()
+        except Exception as e:
+            log.error(f"[DEPTH] {e}")
+
+
+def depth_export(days):
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    rs = conn.execute("""SELECT d.*, m.outcome FROM depth5 d LEFT JOIN depth5_mkts m
+                         ON m.asset=d.asset AND m.open_ts=d.open_ts
+                         WHERE d.ts >= ? ORDER BY d.id""", (time.time() - days * 86400,)).fetchall()
+    conn.close()
+    if not rs:
+        tg("no depth data yet", force=True)
+        return
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(rs[0].keys())
+    w.writerows([list(r) for r in rs])
+    data = gzip.compress(buf.getvalue().encode())
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                          data={"chat_id": TELEGRAM_CHAT_ID,
+                                "caption": f"{len(rs)} depth snapshots · {days:g} day(s)"},
+                          files={"document": (f"lastmin_depth_{days:g}d.csv.gz", data,
+                                              "application/gzip")}, timeout=300)
+        if r.status_code != 200:
+            tg(f"⚠️ upload failed ({r.status_code}) — try fewer days", force=True)
+    except Exception as e:
+        tg(f"⚠️ upload failed: {e}", force=True)
+
+
 _upd = None
 
 def handle_commands():
@@ -770,6 +895,12 @@ def handle_commands():
                     days = 3
                 threading.Thread(target=export_prices_worker, args=(days,),
                                  daemon=True).start()
+            elif t == "/exportdepth":
+                try:
+                    days = max(0.1, min(7.0, float(arg))) if arg else 1.0
+                except ValueError:
+                    days = 1.0
+                threading.Thread(target=depth_export, args=(days,), daemon=True).start()
             elif t == "/backtest":
                 bt_start(parts[1:])
             elif t == "/exportbt":
@@ -791,6 +922,7 @@ def handle_commands():
                    "/exporttrail — trailing-side trades as CSV\n"
                    "/backtest 2026-10-04 [2026-10-05] — replay 5m 9–13¢ from real trade history\n"
                    "/exportbt — backtest results as CSV\n"
+                   "/exportdepth [days] — 5m cheap-side order books (default 1 day)\n"
                    "/mute · /unmute — window messages off/on\n/help — this list",
                    force=True)
     except Exception:
@@ -1121,10 +1253,14 @@ def main():
           f"{TRAIL_MIN_CENTS:.0f}–{TRAIL_MAX_CENTS:.0f}¢ · spread ≤{TRAIL_MAX_SPREAD_CENTS:.0f}¢ · "
           f"{len(TRAIL_COINS)} coins · /trailstats\n"
           if TRAIL_ENABLED else "")
+       + (f"📚 5m depth recorder ON: cheap side ≤{DEPTH_MAX_CENTS:.0f}¢, first {DEPTH_UNTIL}s · /exportdepth\n"
+          if DEPTH_ENABLED else "")
        + "/stats · /help", force=True)
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
     threading.Thread(target=snap_scorer, daemon=True).start()
+    if DEPTH_ENABLED:
+        threading.Thread(target=depth_worker, daemon=True).start()
     while True:
         try:
             handle_commands()
