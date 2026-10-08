@@ -826,6 +826,115 @@ def depth_export(days):
         tg(f"⚠️ upload failed: {e}", force=True)
 
 
+
+# ── 15m depth recorder (for the dip-bot XRP/BTC inverse idea) ────────────────
+# Every DEPTH15_STEP seconds through each 15m market, saves BOTH sides' ask books
+# for DEPTH15_COINS and what $10/$20/$50/$100 would really cost. Records only.
+# Later joined to the dip bot's trades by time to price bigger stakes.
+DEPTH15_ENABLED = os.environ.get("DEPTH15_ENABLED", "true").lower() in ("1", "true", "yes")
+DEPTH15_COINS = [c.strip().upper() for c in
+                 os.environ.get("DEPTH15_COINS", "XRP,BTC").split(",") if c.strip()]
+DEPTH15_STEP = int(os.environ.get("DEPTH15_STEP", "15"))
+DEPTH15_KEEP_DAYS = float(os.environ.get("DEPTH15_KEEP_DAYS", "4"))
+DEPTH15_STAKES = [5, 10, 20, 50, 100]
+depth15_done = set()
+
+
+def depth15_init():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("""CREATE TABLE IF NOT EXISTS depth15 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, asset TEXT, open_ts INTEGER,
+        secs_into REAL, up_ask REAL, up_bid REAL, dn_ask REAL, dn_bid REAL,
+        up_v5 REAL, up_v10 REAL, up_v20 REAL, up_v50 REAL, up_v100 REAL,
+        dn_v5 REAL, dn_v10 REAL, dn_v20 REAL, dn_v50 REAL, dn_v100 REAL,
+        up_asks TEXT, dn_asks TEXT)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS depth15_ts ON depth15(ts)")
+    conn.commit()
+    conn.close()
+
+
+def _vw_list(asks):
+    out = []
+    for st in DEPTH15_STAKES:
+        f = vwap_fill(asks, st)
+        out.append(round(f[0], 4) if f and f[2] >= st - 1e-6 else None)
+    return out
+
+
+def depth15_one(asset, open_ts, secs_into):
+    tk = resolve_tokens(asset, 15, open_ts)
+    if not tk:
+        return None
+    up, dn = get_book(tk[0]), get_book(tk[1])
+    if not up or not dn:
+        return None
+    lv = lambda bk: json.dumps([(round(p, 2), round(s, 2)) for p, s in bk["asks"]
+                                if p <= bk["ask"] + 30][:60])
+    return (time.time(), asset, open_ts, round(secs_into, 1), up["ask"], up["bid"],
+            dn["ask"], dn["bid"], *_vw_list(up["asks"]), *_vw_list(dn["asks"]),
+            lv(up), lv(dn))
+
+
+def depth15_worker():
+    depth15_init()
+    last_prune = 0
+    while True:
+        try:
+            time.sleep(1)
+            now = time.time()
+            o = int(now // 900) * 900
+            into = now - o
+            step = int(into // DEPTH15_STEP)
+            if (o, step) not in depth15_done and into < 895:
+                depth15_done.add((o, step))
+                futs = [_pool.submit(depth15_one, a, o, into) for a in DEPTH15_COINS]
+                rows = [r for r in (f.result() for f in futs) if r]
+                if rows:
+                    conn = sqlite3.connect(DB_PATH, timeout=30)
+                    conn.executemany(f"INSERT INTO depth15 (ts,asset,open_ts,secs_into,up_ask,"
+                                     f"up_bid,dn_ask,dn_bid,up_v5,up_v10,up_v20,up_v50,up_v100,"
+                                     f"dn_v5,dn_v10,dn_v20,dn_v50,dn_v100,up_asks,dn_asks) "
+                                     f"VALUES ({','.join('?' * 20)})", rows)
+                    conn.commit()
+                    conn.close()
+            if len(depth15_done) > 3000:
+                depth15_done.clear()
+            if now - last_prune > 3600:
+                last_prune = now
+                conn = sqlite3.connect(DB_PATH, timeout=30)
+                conn.execute("DELETE FROM depth15 WHERE ts < ?", (now - DEPTH15_KEEP_DAYS * 86400,))
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            log.error(f"[DEPTH15] {e}")
+
+
+def depth15_export(days):
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    rs = conn.execute("SELECT * FROM depth15 WHERE ts >= ? ORDER BY id",
+                      (time.time() - days * 86400,)).fetchall()
+    conn.close()
+    if not rs:
+        tg("no 15m depth data yet", force=True)
+        return
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(rs[0].keys())
+    w.writerows([list(r) for r in rs])
+    data = gzip.compress(buf.getvalue().encode())
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                          data={"chat_id": TELEGRAM_CHAT_ID,
+                                "caption": f"{len(rs)} 15m depth snapshots · {days:g} day(s)"},
+                          files={"document": (f"lastmin_depth15_{days:g}d.csv.gz", data,
+                                              "application/gzip")}, timeout=300)
+        if r.status_code != 200:
+            tg(f"⚠️ upload failed ({r.status_code}) — try fewer days", force=True)
+    except Exception as e:
+        tg(f"⚠️ upload failed: {e}", force=True)
+
+
 _upd = None
 
 def handle_commands():
@@ -895,6 +1004,12 @@ def handle_commands():
                     days = 3
                 threading.Thread(target=export_prices_worker, args=(days,),
                                  daemon=True).start()
+            elif t == "/exportdepth15":
+                try:
+                    days = max(0.1, min(4.0, float(arg))) if arg else 1.0
+                except ValueError:
+                    days = 1.0
+                threading.Thread(target=depth15_export, args=(days,), daemon=True).start()
             elif t == "/exportdepth":
                 try:
                     days = max(0.1, min(7.0, float(arg))) if arg else 1.0
@@ -923,6 +1038,7 @@ def handle_commands():
                    "/backtest 2026-10-04 [2026-10-05] — replay 5m 9–13¢ from real trade history\n"
                    "/exportbt — backtest results as CSV\n"
                    "/exportdepth [days] — 5m cheap-side order books (default 1 day)\n"
+                   "/exportdepth15 [days] — 15m XRP/BTC order books, both sides\n"
                    "/mute · /unmute — window messages off/on\n/help — this list",
                    force=True)
     except Exception:
@@ -1255,12 +1371,16 @@ def main():
           if TRAIL_ENABLED else "")
        + (f"📚 5m depth recorder ON: cheap side ≤{DEPTH_MAX_CENTS:.0f}¢, first {DEPTH_UNTIL}s · /exportdepth\n"
           if DEPTH_ENABLED else "")
+       + (f"📚 15m depth recorder ON: {','.join(DEPTH15_COINS)} both sides every {DEPTH15_STEP}s · /exportdepth15\n"
+          if DEPTH15_ENABLED else "")
        + "/stats · /help", force=True)
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
     threading.Thread(target=snap_scorer, daemon=True).start()
     if DEPTH_ENABLED:
         threading.Thread(target=depth_worker, daemon=True).start()
+    if DEPTH15_ENABLED:
+        threading.Thread(target=depth15_worker, daemon=True).start()
     while True:
         try:
             handle_commands()
