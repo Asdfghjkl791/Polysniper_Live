@@ -935,6 +935,114 @@ def depth15_export(days):
         tg(f"⚠️ upload failed: {e}", force=True)
 
 
+# ── Binance→Polymarket LAG recorder (records only, never trades) ─────────────
+# Every LAG_STEP seconds: the latest Binance mid (and how old it is) next to the
+# current Polymarket 15m UP book for LAG_COINS, with request send/receive times.
+# Offline we line the two up to see how long Polymarket takes to reprice after
+# Binance moves, and whether the gap is ever bigger than the taker fee.
+LAG_ENABLED = os.environ.get("LAG_ENABLED", "true").lower() in ("1", "true", "yes")
+LAG_COINS = [c.strip().upper() for c in os.environ.get("LAG_COINS", "BTC").split(",") if c.strip()]
+LAG_TF = int(os.environ.get("LAG_TF", "15"))
+LAG_STEP = float(os.environ.get("LAG_STEP", "0.25"))
+LAG_KEEP_DAYS = float(os.environ.get("LAG_KEEP_DAYS", "2"))
+
+
+def _book_top(token_id):
+    """-> (bid, bid_size, ask, ask_size) in cents/shares, or None."""
+    try:
+        b = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id}, timeout=3).json()
+        asks = [(float(a["price"]) * 100, float(a["size"])) for a in b.get("asks", [])
+                if float(a.get("size", 0)) > 0]
+        bids = [(float(x["price"]) * 100, float(x["size"])) for x in b.get("bids", [])
+                if float(x.get("size", 0)) > 0]
+        if not asks or not bids:
+            return None
+        a, bb = min(asks), max(bids)
+        return bb[0], bb[1], a[0], a[1]
+    except Exception:
+        return None
+
+
+def lag_init():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("""CREATE TABLE IF NOT EXISTS lag (
+        t0 REAL, t1 REAL, asset TEXT, tf INTEGER, open_ts INTEGER, secs_into REAL,
+        bin_mid REAL, bin_age REAL, bin_mid_after REAL,
+        up_bid REAL, up_bid_sz REAL, up_ask REAL, up_ask_sz REAL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS lag_t0 ON lag(t0)")
+    conn.commit()
+    conn.close()
+
+
+def _lag_one(asset):
+    L = LAG_TF * 60
+    t0 = time.time()
+    o = int(t0 // L) * L
+    tk = resolve_tokens(asset, LAG_TF, o)
+    if not tk:
+        return None
+    mid0, age = prices_ref.get(asset), t0 - ref_last.get(asset, 0)
+    top = _book_top(tk[0])
+    t1 = time.time()
+    if not top or mid0 is None:
+        return None
+    return (round(t0, 3), round(t1, 3), asset, LAG_TF, o, round(t0 - o, 2), mid0,
+            round(age, 3), prices_ref.get(asset), *top)
+
+
+def lag_worker():
+    lag_init()
+    buf, last_flush, last_prune = [], time.time(), 0
+    while True:
+        try:
+            start = time.time()
+            futs = [_pool.submit(_lag_one, a) for a in LAG_COINS]
+            buf.extend(r for r in (f.result() for f in futs) if r)
+            now = time.time()
+            if now - last_flush > 5 and buf:
+                conn = sqlite3.connect(DB_PATH, timeout=30)
+                conn.executemany("INSERT INTO lag VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", buf)
+                conn.commit()
+                conn.close()
+                buf, last_flush = [], now
+            if now - last_prune > 3600:
+                last_prune = now
+                conn = sqlite3.connect(DB_PATH, timeout=30)
+                conn.execute("DELETE FROM lag WHERE t0 < ?", (now - LAG_KEEP_DAYS * 86400,))
+                conn.commit()
+                conn.close()
+            time.sleep(max(0.0, LAG_STEP - (time.time() - start)))
+        except Exception as e:
+            log.error(f"[LAG] {e}")
+            time.sleep(2)
+
+
+def lag_export(hours):
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    rs = conn.execute("SELECT * FROM lag WHERE t0 >= ? ORDER BY t0",
+                      (time.time() - hours * 3600,)).fetchall()
+    cols = [d[0] for d in conn.execute("SELECT * FROM lag LIMIT 0").description]
+    conn.close()
+    if not rs:
+        tg("no lag data yet", force=True)
+        return
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    w.writerows(rs)
+    data = gzip.compress(buf.getvalue().encode())
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                          data={"chat_id": TELEGRAM_CHAT_ID,
+                                "caption": f"{len(rs)} lag samples · last {hours:g}h"},
+                          files={"document": (f"lastmin_lag_{hours:g}h.csv.gz", data,
+                                              "application/gzip")}, timeout=300)
+        if r.status_code != 200:
+            tg(f"⚠️ upload failed ({r.status_code}) — try fewer hours, e.g. /exportlag 3", force=True)
+    except Exception as e:
+        tg(f"⚠️ upload failed: {e}", force=True)
+
+
 _upd = None
 
 def handle_commands():
@@ -1004,6 +1112,13 @@ def handle_commands():
                     days = 3
                 threading.Thread(target=export_prices_worker, args=(days,),
                                  daemon=True).start()
+            elif t == "/exportlag":
+                try:
+                    hrs = max(0.5, min(48.0, float(arg))) if arg else 6.0
+                except ValueError:
+                    hrs = 6.0
+                tg(f"⏳ packing lag data for the last {hrs:g}h…", force=True)
+                threading.Thread(target=lag_export, args=(hrs,), daemon=True).start()
             elif t == "/exportdepth15":
                 try:
                     days = max(0.1, min(4.0, float(arg))) if arg else 1.0
@@ -1039,6 +1154,7 @@ def handle_commands():
                    "/exportbt — backtest results as CSV\n"
                    "/exportdepth [days] — 5m cheap-side order books (default 1 day)\n"
                    "/exportdepth15 [days] — 15m XRP/BTC order books, both sides\n"
+                   "/exportlag [hours] — Binance vs Polymarket timing data (default 6h)\n"
                    "/mute · /unmute — window messages off/on\n/help — this list",
                    force=True)
     except Exception:
@@ -1373,6 +1489,8 @@ def main():
           if DEPTH_ENABLED else "")
        + (f"📚 15m depth recorder ON: {','.join(DEPTH15_COINS)} both sides every {DEPTH15_STEP}s · /exportdepth15\n"
           if DEPTH15_ENABLED else "")
+       + (f"⏱ lag recorder ON: {','.join(LAG_COINS)} {LAG_TF}m every {LAG_STEP:g}s · /exportlag\n"
+          if LAG_ENABLED else "")
        + "/stats · /help", force=True)
     threading.Thread(target=monitor, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
@@ -1381,6 +1499,8 @@ def main():
         threading.Thread(target=depth_worker, daemon=True).start()
     if DEPTH15_ENABLED:
         threading.Thread(target=depth15_worker, daemon=True).start()
+    if LAG_ENABLED:
+        threading.Thread(target=lag_worker, daemon=True).start()
     while True:
         try:
             handle_commands()
