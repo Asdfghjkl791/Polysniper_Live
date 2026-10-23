@@ -42,6 +42,7 @@ SAMPLE_SECS = float(os.environ.get("SAMPLE_SECS", "0.25"))
 STAKE = float(os.environ.get("STAKE", "50"))
 RTDS_MODE = os.environ.get("RTDS_MODE", "both").lower()
 KEEP_DAYS = float(os.environ.get("KEEP_DAYS", "14"))
+V1_IDLE_SECS = float(os.environ.get("V1_IDLE_SECS", "6"))   # reconnect v1 when it goes quiet this long
 FEE_RATE = 0.07
 GAMMA = "https://gamma-api.polymarket.com"
 MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -371,14 +372,23 @@ def api_creds():
     pk = os.environ.get("POLY_PRIVATE_KEY")
     if not pk:
         return None
-    try:
-        from py_clob_client.client import ClobClient
-        c = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
-        cr = c.create_or_derive_api_creds()
-        return cr.api_key, cr.api_secret, cr.api_passphrase
-    except Exception as e:
-        log.error(f"could not derive API credentials: {e}")
-        return None
+    errs = []
+    for modname in ("py_clob_client.client", "py_clob_client_v2.client", "py_clob_client_v2"):
+        try:
+            mod = __import__(modname, fromlist=["ClobClient"])
+            c = mod.ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
+            cr = c.create_or_derive_api_creds()
+            k = getattr(cr, "api_key", None) or (cr.get("apiKey") if isinstance(cr, dict) else None)
+            s_ = getattr(cr, "api_secret", None) or (cr.get("secret") if isinstance(cr, dict) else None)
+            p_ = getattr(cr, "api_passphrase", None) or (cr.get("passphrase") if isinstance(cr, dict) else None)
+            if k and s_ and p_:
+                return k, s_, p_
+            errs.append(f"{modname}: no creds in reply")
+        except Exception as e:
+            errs.append(f"{modname}: {e}")
+    log.error(f"could not derive API credentials: {' | '.join(errs)}")
+    stats["v2_err"] = errs[-1][:120] if errs else ""
+    return None
 
 
 def v2_worker():
@@ -432,18 +442,33 @@ def v1_worker():
                             return
                 threading.Thread(target=pinger, daemon=True).start()
 
+            last = {"t": time.time()}
+
             def on_message(ws, msg):
                 if msg in ("PONG", "pong", ""):
                     return
+                last["t"] = time.time()
                 ref_handle("v1", msg)
 
             ws = websocket.WebSocketApp(RTDS_V1, on_open=on_open, on_message=on_message)
+
+            def watchdog():
+                while not stop.is_set():
+                    time.sleep(2)
+                    if time.time() - last["t"] > V1_IDLE_SECS:     # quiet -> reconnect for a fresh snapshot
+                        stats["v1_reconnects"] = stats.get("v1_reconnects", 0) + 1
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
+                        return
+            threading.Thread(target=watchdog, daemon=True).start()
             ws.run_forever(ping_interval=20, ping_timeout=10)
             stop.set()
         except Exception as e:
             log.warning(f"v1: {e}")
         stats["v1_state"] = "reconnecting"
-        time.sleep(5)
+        time.sleep(1)
 
 
 # ── sampling ────────────────────────────────────────────────────────────────
@@ -587,7 +612,8 @@ def pred(o, c):
 def cl_text():
     now = time.time()
     L = [f"🔗 <b>FINAL-MINUTE LOGGER</b> · {','.join(ASSETS)} {'/'.join(f'{t}m' for t in TFS)} · last {LAST_SECS:g}s",
-         f"feeds: ref v2 {stats['v2_state']} ({stats['v2_msgs']} msgs) · ref v1 {stats['v1_state']} ({stats['v1_msgs']}) · "
+         f"feeds: ref v2 {stats['v2_state']} ({stats['v2_msgs']} msgs{' · ' + stats['v2_err'] if stats.get('v2_err') else ''}) · "
+         f"ref v1 {stats['v1_state']} ({stats['v1_msgs']} msgs, {stats.get('v1_reconnects', 0)} refreshes) · "
          f"binance {stats['bn_msgs']} · book msgs {stats['pm_msgs']} · samples {stats['samples']} · errors {stats['errors']}"]
     for src in ("v2", "v1"):
         for a in ASSETS:
