@@ -631,6 +631,44 @@ def cl_text():
     return "\n".join(L)
 
 
+OLD_TABLES = {"/export": ("trades", "lastmin_trades.csv.gz"), "/exporttrail": ("trail", "trail_trades.csv.gz"),
+              "/exportsnaps": ("snaps", "lastmin_snaps.csv.gz")}
+
+
+def old_export(cmd):
+    """data left by the old paper last-minute bot (same DB file) - read only"""
+    have = {r[0] for r in db_query("SELECT name FROM sqlite_master WHERE type='table'")}
+    if cmd == "/oldstats":
+        L = ["📦 <b>old last-minute paper bot</b> (data kept in the database)"]
+        for tb, lab in (("trades", "leader"), ("trail", "trailing side"), ("snaps", "snapshots")):
+            if tb not in have:
+                L.append(f"{lab}: no table")
+                continue
+            if tb == "snaps":
+                n = db_query("SELECT COUNT(*) FROM snaps")[0][0]
+                L.append(f"{lab}: {n} rows")
+                continue
+            cols = {r[1] for r in db_query(f"PRAGMA table_info({tb})")}
+            pcol = "pnl_net" if "pnl_net" in cols else None
+            n = db_query(f"SELECT COUNT(*) FROM {tb}")[0][0]
+            if pcol:
+                r = db_query(f"SELECT COUNT(*), SUM(result='WIN'), SUM({pcol}) FROM {tb} WHERE result IN ('WIN','LOSS')")[0]
+                L.append(f"{lab}: {n} rows · settled {r[0]} · wins {r[1] or 0} · net {money(r[2] or 0)}")
+            else:
+                L.append(f"{lab}: {n} rows")
+        tg("\n".join(L))
+        return
+    tb, name = OLD_TABLES[cmd]
+    if tb not in have:
+        tg(f"no '{tb}' table in this database")
+        return
+    rows = db_query(f"SELECT * FROM {tb}")
+    if not rows:
+        tg(f"'{tb}' is empty")
+        return
+    tg_document(name, rows_csv_gz(rows), f"{len(rows)} rows from the old bot's '{tb}' table")
+
+
 def telegram_worker():
     off = 0
     while True:
@@ -657,9 +695,14 @@ def telegram_worker():
                         tg_document("fm_raw.csv.gz", rows_csv_gz(raw), "first raw messages per feed")
                     if not s and not m:
                         tg("nothing logged yet")
+                elif t in ("/export", "/exporttrail", "/exportsnaps", "/oldstats"):
+                    old_export(t)
                 elif t in ("/help", "/start"):
                     tg("🔗 final-minute logger (paper, no orders)\n/cl — status + match rates + paper edge\n"
-                       "/clexport — raw data (gz CSV)")
+                       "/clexport — raw data (gz CSV)\n"
+                       "old last-minute paper bot data (kept in the same database):\n"
+                       "/oldstats — its totals · /export — leader trades · /exporttrail — trailing-side trades · "
+                       "/exportsnaps — timing snapshots")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
