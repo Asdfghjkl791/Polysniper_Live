@@ -1,71 +1,67 @@
 #!/usr/bin/env python3
-# FINAL-MINUTE LOGGER (paper, Oct 23 2026) - places NO orders.
+# LONG-MARKET JUMP LOGGER (paper, Oct 26 2026) - places NO orders.
+# Replaces the final-minute logger in the worker service (that one found no edge).
 #
-# Question it answers: in the last ~90 seconds of each BTC/ETH 5m and 15m up/down market,
-# does Polymarket's order book lag the price the market SETTLES on (the Chainlink-style
-# reference price Polymarket publishes)? If the book is slow, buying the side the reference
-# price says is winning could be an edge.
+# Same test as the main bot's 5m/15m jump logger, but on the LONGER up/down markets:
+# when BTC/ETH/SOL moves >= JL_BPS within JL_WINDOW seconds on Binance, snapshot the
+# Polymarket books of that coin's live 1h, 4h and daily markets at +0, 0.1, 0.25, 0.5, 1,
+# 2, 5 and 10 seconds (best bid/ask both sides, $ on offer, top 6 levels) plus the model
+# fair price at the jump. Settled outcomes are logged too, so "hold to the end" can be checked.
 #
-# What it records
-#   - the reference price from Polymarket's live-data socket (two versions are tried:
-#     v2 = wss://ws-live-v2.polymarket.com/ws  (needs API credentials)
-#     v1 = wss://ws-live-data.polymarket.com   (crypto_prices_chainlink topic, no login))
-#   - Binance BTC/ETH price (bookTicker)
-#   - the Polymarket order book of each live market (best bid/ask both sides + $ on offer)
-#   - every SAMPLE_SECS (0.25s) during the last LAST_SECS (90s) of each window
-#   - after each window: the real outcome, and what the reference price and Binance said
-#
-# Commands (Telegram, use a NEW bot token from @BotFather - not the scanner's):
-#   /cl          status + does the reference price match settlement? + paper edge check
-#   /clexport    raw samples + settled markets (gzipped CSV)
+# Commands (Telegram, this bot's own token):
+#   /jumps        paper sniper versions per coin per market length (last 24h)
+#   /jumpexport   raw jump snapshots + settled outcomes (gzipped CSV)
+#   /clexport     the old final-minute logger data (kept in the same database)
+#   /oldstats /export /exporttrail /exportsnaps   data from the older last-minute bot
 #   /help
 #
 # ENV (required): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# ENV (for the v2 socket, optional): POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE
-#   or POLY_PRIVATE_KEY (credentials are derived from it; read-only use, nothing is traded)
-# ENV (optional): ASSETS=BTC,ETH  TFS=5,15  LAST_SECS=90  SAMPLE_SECS=0.25  STAKE=50
-#   RTDS_MODE=both|v2|v1  DB_PATH=final_minute.db  KEEP_DAYS=14
+# ENV (optional): ASSETS=BTC,ETH,SOL  TFS=60,240,1440  JL_BPS=5  JL_WINDOW=2  JL_COOLDOWN=10
+#   JL_STAKE=50  DB_PATH=final_minute.db  KEEP_DAYS=30
 
-import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip
+import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip, math
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import websocket
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 DB_PATH = os.environ.get("DB_PATH", "final_minute.db")
-ASSETS = [a.strip().upper() for a in os.environ.get("ASSETS", "BTC,ETH").split(",") if a.strip()]
-TFS = [int(x) for x in os.environ.get("TFS", "5,15").split(",") if x.strip()]
-LAST_SECS = float(os.environ.get("LAST_SECS", "90"))
-SAMPLE_SECS = float(os.environ.get("SAMPLE_SECS", "0.25"))
-STAKE = float(os.environ.get("STAKE", "50"))
-RTDS_MODE = os.environ.get("RTDS_MODE", "both").lower()
-KEEP_DAYS = float(os.environ.get("KEEP_DAYS", "14"))
-V1_IDLE_SECS = float(os.environ.get("V1_IDLE_SECS", "6"))   # reconnect v1 when it goes quiet this long
+ASSETS = [a.strip().upper() for a in os.environ.get("ASSETS", "BTC,ETH,SOL").split(",") if a.strip()]
+TFS = [int(x) for x in os.environ.get("TFS", "60,240,1440").split(",") if x.strip()]
+JL_BPS = float(os.environ.get("JL_BPS", "5"))
+JL_WINDOW = float(os.environ.get("JL_WINDOW", "2"))
+JL_COOLDOWN = float(os.environ.get("JL_COOLDOWN", "10"))
+JL_STAKE = float(os.environ.get("JL_STAKE", "50"))
+KEEP_DAYS = float(os.environ.get("KEEP_DAYS", "30"))
+JL_OFFSETS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
 FEE_RATE = 0.07
 GAMMA = "https://gamma-api.polymarket.com"
 MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-RTDS_V2 = os.environ.get("RTDS_V2_URL", "wss://ws-live-v2.polymarket.com/ws")
-RTDS_V1 = os.environ.get("RTDS_V1_URL", "wss://ws-live-data.polymarket.com")
 BINANCE_WS = ("wss://data-stream.binance.vision/stream?streams=" +
               "/".join(f"{a.lower()}usdt@bookTicker" for a in ASSETS))
+BINANCE_REST = os.environ.get("BINANCE_REST", "https://data-api.binance.vision/api/v3/klines")
 ET = ZoneInfo("America/New_York")
+FULLNAME = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "xrp", "DOGE": "dogecoin",
+            "BNB": "bnb", "HYPE": "hype"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("final-minute")
+log = logging.getLogger("long-jumps")
 
-lock = threading.RLock()
+lock = threading.RLock()          # books / markets
+jlock = threading.Lock()          # jump detection state
 db_lock = threading.Lock()
-# reference prices: src -> asset -> deque[(oracle_ts_seconds, value, received_at)]
-ref = {"v2": {a: deque(maxlen=20000) for a in ASSETS}, "v1": {a: deque(maxlen=20000) for a in ASSETS}}
-bn = {a: deque(maxlen=200000) for a in ASSETS}          # (ts, mid)
-books = {}                                               # token -> {"bids": {px: sz}, "asks": {px: sz}}
-tokmap = {}                                              # token -> (asset, tf, open_ts, side)
-markets = {}                                             # (asset, tf, open_ts) -> (up_tok, dn_tok)
-stats = {"v2_msgs": 0, "v1_msgs": 0, "bn_msgs": 0, "pm_msgs": 0, "v2_state": "off", "v1_state": "off",
-         "samples": 0, "errors": 0, "started": time.time()}
-raw_seen = {"v2": 0, "v1": 0}
+books = {}                        # token -> {"bids": {px: sz}, "asks": {px: sz}}
+markets = {}                      # (asset, tf, open_ts) -> (up_tok, dn_tok)
+prices = {}                       # asset -> latest Binance mid
+ticks = {a: deque(maxlen=5000) for a in ASSETS}     # (ts, px) every update, last JL_WINDOW s
+px1s = {a: deque(maxlen=1200) for a in ASSETS}      # (ts, px) ~1/s, for the volatility estimate
+opens = {}                        # (asset, tf, open_ts) -> window start price
+last_jump = {a: 0.0 for a in ASSETS}
+pending = []
+stats = {"bn_msgs": 0, "pm_msgs": 0, "jumps": {a: 0 for a in ASSETS}, "rows": 0, "errors": 0,
+         "started": time.time()}
 
 
 def fee(shares, p):
@@ -74,6 +70,10 @@ def fee(shares, p):
 
 def money(x):
     return f"{'+' if x >= 0 else chr(0x2212)}${abs(x):.2f}"
+
+
+def label(tf):
+    return {60: "1h", 240: "4h", 1440: "1d"}.get(tf, f"{tf}m")
 
 
 # ── database ────────────────────────────────────────────────────────────────
@@ -86,16 +86,13 @@ def db():
 def init_db():
     with db_lock:
         c = db()
-        c.execute("""CREATE TABLE IF NOT EXISTS samples (ts REAL, asset TEXT, tf INTEGER, open_ts INTEGER,
-            secs_left REAL, ref_v2 REAL, ref_v2_age REAL, ref_v1 REAL, ref_v1_age REAL, binance REAL,
-            strike_v2 REAL, strike_v1 REAL, strike_bn REAL, up_bid REAL, up_ask REAL, dn_bid REAL,
-            dn_ask REAL, up_ask_usd REAL, dn_ask_usd REAL)""")
-        c.execute("CREATE INDEX IF NOT EXISTS s_mkt ON samples(asset, tf, open_ts)")
-        c.execute("CREATE INDEX IF NOT EXISTS s_ts ON samples(ts)")
-        c.execute("""CREATE TABLE IF NOT EXISTS mkts (asset TEXT, tf INTEGER, open_ts INTEGER, outcome TEXT,
-            v2_open REAL, v2_close REAL, v1_open REAL, v1_close REAL, bn_open REAL, bn_close REAL,
-            PRIMARY KEY (asset, tf, open_ts))""")
-        c.execute("CREATE TABLE IF NOT EXISTS raw (ts REAL, src TEXT, msg TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS lj_jumps (jid INTEGER, t0 REAL, bps REAL, tf INTEGER,
+            open_ts INTEGER, off REAL, real_dt REAL, btc REAL, up_bid REAL, up_ask REAL, dn_bid REAL,
+            dn_ask REAL, secs_left REAL, fair_up REAL, up_ask_usd REAL, dn_ask_usd REAL, asset TEXT,
+            ladder TEXT, strike REAL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS lj_t0 ON lj_jumps(t0)")
+        c.execute("""CREATE TABLE IF NOT EXISTS lj_mkts (asset TEXT, tf INTEGER, open_ts INTEGER, outcome TEXT,
+            strike REAL, PRIMARY KEY (asset, tf, open_ts))""")
         c.commit()
         c.close()
 
@@ -147,25 +144,58 @@ def rows_csv_gz(rows):
 
 # ── markets ─────────────────────────────────────────────────────────────────
 def window(tf, now):
+    """(open_ts, close_ts, secs_left) of the live window; 1h/4h on ET clock hours, daily noon ET -> noon ET"""
+    now_et = datetime.fromtimestamp(now, tz=ET)
+    if tf == 1440:
+        st = now_et.replace(hour=12, minute=0, second=0, microsecond=0)
+        if now_et < st:
+            st = st - timedelta(days=1)
+        en = (st + timedelta(days=1)).replace(hour=12)
+        o, c = int(st.timestamp()), int(en.timestamp())
+        return o, c, c - now
+    if tf == 60:
+        o = int(now_et.replace(minute=0, second=0, microsecond=0).timestamp())
+        return o, o + 3600, o + 3600 - now
+    if tf == 240:
+        o = int(now_et.replace(hour=(now_et.hour // 4) * 4, minute=0, second=0, microsecond=0).timestamp())
+        return o, o + 14400, o + 14400 - now
     L = tf * 60
     o = int(now // L) * L
     return o, o + L, o + L - now
 
 
+def close_of(tf, open_ts):
+    return window(tf, open_ts + 1)[1]
+
+
 def slug(asset, tf, open_ts):
+    if tf == 1440:
+        d = datetime.fromtimestamp(open_ts, tz=ET) + timedelta(days=1)
+        return f"{FULLNAME[asset]}-up-or-down-on-{d.strftime('%B').lower()}-{d.day}-{d.year}"
+    if tf == 240:
+        return f"{asset.lower()}-updown-4h-{open_ts}"
+    if tf == 60:
+        e = datetime.fromtimestamp(open_ts, tz=ET)
+        h = e.strftime("%I").lstrip("0") or "12"
+        return f"{FULLNAME[asset]}-up-or-down-{e.strftime('%B').lower()}-{e.day}-{e.year}-{h}{e.strftime('%p').lower()}-et"
     return f"{asset.lower()}-updown-{tf}m-{open_ts}"
+
+
+def gamma_market(asset, tf, open_ts):
+    r = requests.get(f"{GAMMA}/events", params={"slug": slug(asset, tf, open_ts)}, timeout=10)
+    arr = r.json()
+    ev = arr[0] if isinstance(arr, list) and arr else arr
+    mk = ev.get("markets", []) if isinstance(ev, dict) else []
+    return mk[0] if mk else None
 
 
 def resolve(asset, tf, open_ts):
     try:
-        r = requests.get(f"{GAMMA}/events", params={"slug": slug(asset, tf, open_ts)}, timeout=8)
-        arr = r.json()
-        ev = arr[0] if isinstance(arr, list) and arr else arr
-        mk = ev.get("markets", []) if isinstance(ev, dict) else []
-        if mk:
-            t = json.loads(mk[0].get("clobTokenIds", "[]"))
+        m = gamma_market(asset, tf, open_ts)
+        if m:
+            t = json.loads(m.get("clobTokenIds", "[]"))
             if len(t) == 2:
-                return t[0], t[1]
+                return str(t[0]), str(t[1])
     except Exception as e:
         log.debug(f"resolve {asset} {tf} {open_ts}: {e}")
     return None
@@ -173,22 +203,37 @@ def resolve(asset, tf, open_ts):
 
 def outcome(asset, tf, open_ts):
     try:
-        r = requests.get(f"{GAMMA}/events", params={"slug": slug(asset, tf, open_ts)}, timeout=10)
-        d = r.json()
-        mk = d[0].get("markets", []) if isinstance(d, list) and d else []
-        if not mk:
+        m = gamma_market(asset, tf, open_ts)
+        if not m:
             return None
-        op = mk[0].get("outcomePrices")
+        op = m.get("outcomePrices")
         op = json.loads(op) if isinstance(op, str) else op
-        if not op or len(op) < 2:
-            return None
-        if float(op[0]) >= 0.99:
-            return "UP"
-        if float(op[1]) >= 0.99:
-            return "DOWN"
+        if op and len(op) >= 2:
+            if float(op[0]) >= 0.99:
+                return "UP"
+            if float(op[1]) >= 0.99:
+                return "DOWN"
     except Exception as e:
         log.warning(f"outcome {asset} {tf} {open_ts}: {e}")
     return None
+
+
+def fetch_open(asset, tf, open_ts):
+    """window start price = Binance 1m open at the window start (fetched once, cached)"""
+    k = (asset, tf, open_ts)
+    if opens.get(k):
+        return
+    try:
+        r = requests.get(BINANCE_REST, params=dict(symbol=f"{asset}USDT", interval="1m",
+                                                   startTime=int(open_ts) * 1000,
+                                                   endTime=int(open_ts) * 1000 + 59000, limit=1), timeout=8)
+        j = r.json()
+        if isinstance(j, list) and j:
+            opens[k] = float(j[0][1])
+            db_exec("INSERT OR IGNORE INTO lj_mkts (asset, tf, open_ts, strike) VALUES (?,?,?,?)",
+                    (asset, tf, open_ts, opens[k]))
+    except Exception as e:
+        log.warning(f"open price {k}: {e}")
 
 
 def resolver_worker():
@@ -197,26 +242,45 @@ def resolver_worker():
             now = time.time()
             for a in ASSETS:
                 for tf in TFS:
-                    for o in (window(tf, now)[0], window(tf, now + 60)[0]):   # current + next
-                        k = (a, tf, o)
-                        if k in markets:
+                    cur = window(tf, now)[0]
+                    if now >= cur + 60:
+                        fetch_open(a, tf, cur)
+                    for o in (cur, window(tf, now + 120)[0]):        # current + next
+                        if (a, tf, o) in markets:
                             continue
                         t = resolve(a, tf, o)
                         if t:
                             with lock:
-                                markets[k] = t
-                                tokmap[t[0]] = (a, tf, o, "UP")
-                                tokmap[t[1]] = (a, tf, o, "DOWN")
+                                markets[(a, tf, o)] = t
             with lock:
-                for k in [k for k in markets if k[2] + k[1] * 60 < now - 600]:
-                    up, dn = markets.pop(k)
-                    for t in (up, dn):
-                        tokmap.pop(t, None)
+                for k in [k for k in markets if close_of(k[1], k[2]) < now - 300]:
+                    for t in markets.pop(k):
                         books.pop(t, None)
+            for k in [k for k in opens if close_of(k[1], k[2]) < now - 86400]:
+                opens.pop(k, None)
         except Exception as e:
             stats["errors"] += 1
             log.error(f"resolver: {e}")
-        time.sleep(3)
+        time.sleep(5)
+
+
+def settler():
+    """fill in outcomes of finished windows (for the hold-to-the-end check)"""
+    while True:
+        try:
+            now = time.time()
+            rows = db_query("SELECT asset, tf, open_ts FROM lj_mkts WHERE outcome IS NULL")
+            for r in rows:
+                if close_of(r["tf"], r["open_ts"]) > now - 120:
+                    continue
+                o = outcome(r["asset"], r["tf"], r["open_ts"])
+                if o:
+                    db_exec("UPDATE lj_mkts SET outcome=? WHERE asset=? AND tf=? AND open_ts=?",
+                            (o, r["asset"], r["tf"], r["open_ts"]))
+            db_exec("DELETE FROM lj_jumps WHERE t0 < ?", (now - KEEP_DAYS * 86400,))
+        except Exception as e:
+            log.warning(f"settler: {e}")
+        time.sleep(120)
 
 
 # ── feeds ───────────────────────────────────────────────────────────────────
@@ -251,7 +315,7 @@ def pm_worker():
     while True:
         try:
             with lock:
-                toks = tuple(sorted(tokmap))
+                toks = tuple(sorted(t for v in markets.values() for t in v))
             if not toks:
                 time.sleep(2)
                 continue
@@ -274,8 +338,8 @@ def pm_worker():
                     return
                 pm_handle(msg)
                 with lock:
-                    cur = tuple(sorted(tokmap))
-                if cur != toks:
+                    cur = tuple(sorted(t for v in markets.values() for t in v))
+                if cur != toks:                     # new windows -> resubscribe
                     ws.close()
 
             ws = websocket.WebSocketApp(MARKET_WS, on_open=on_open, on_message=on_message)
@@ -287,6 +351,26 @@ def pm_worker():
         time.sleep(1)
 
 
+def on_tick(a, now, px):
+    with jlock:
+        prices[a] = px
+        p1 = px1s[a]
+        if not p1 or now - p1[-1][0] >= 1.0:
+            p1.append((now, px))
+        dq = ticks[a]
+        dq.append((now, px))
+        while dq and dq[0][0] < now - JL_WINDOW:
+            dq.popleft()
+        if now - last_jump[a] < JL_COOLDOWN or len(dq) < 2:
+            return
+        bps = (px / dq[0][1] - 1) * 1e4
+        if abs(bps) < JL_BPS:
+            return
+        last_jump[a] = now
+        stats["jumps"][a] += 1
+        pending.append({"id": int(now * 1000), "asset": a, "t0": now, "bps": round(bps, 2), "done": set()})
+
+
 def bn_worker():
     while True:
         try:
@@ -296,392 +380,200 @@ def bn_worker():
             while True:
                 d = json.loads(ws.recv()).get("data", {})
                 a = str(d.get("s", "")).replace("USDT", "")
-                if a in bn:
+                if a in ticks:
                     b, k = float(d.get("b", 0)), float(d.get("a", 0))
                     if b > 0 and k > 0:
-                        bn[a].append((time.time(), (b + k) / 2))
                         stats["bn_msgs"] += 1
+                        on_tick(a, time.time(), (b + k) / 2)
         except Exception as e:
             log.warning(f"binance: {e}")
         time.sleep(3)
 
 
-SYM = {"btcusd": "BTC", "btc/usd": "BTC", "btc": "BTC", "ethusd": "ETH", "eth/usd": "ETH", "eth": "ETH"}
+# ── fair price ──────────────────────────────────────────────────────────────
+def norm_cdf(z):
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 
-def ref_points(obj, out):
-    """walk any JSON shape and collect (asset, ts_seconds, value) price points"""
-    if isinstance(obj, list):
-        for x in obj:
-            ref_points(x, out)
-        return
-    if not isinstance(obj, dict):
-        return
-    sym = obj.get("symbol")
-    a = SYM.get(str(sym).lower()) if sym else None
-    if a and "value" in obj:
-        try:
-            t = float(obj.get("timestamp") or obj.get("ts") or 0)
-            out.append((a, t / 1000.0 if t > 1e11 else t, float(obj["value"])))
-        except Exception:
-            pass
-    if a and isinstance(obj.get("data"), list):          # snapshot: {"symbol":..,"data":[{timestamp,value}]}
-        for p in obj["data"]:
-            if isinstance(p, dict) and "value" in p:
-                try:
-                    t = float(p.get("timestamp") or 0)
-                    out.append((a, t / 1000.0 if t > 1e11 else t, float(p["value"])))
-                except Exception:
-                    pass
-    for k in ("payload", "data", "result"):
-        v = obj.get(k)
-        if isinstance(v, (dict, list)) and not (a and k == "data"):
-            ref_points(v, out)
+def sigma(a):
+    """per-second vol from ~1s samples over the last 15 min (same recipe as the main bot)"""
+    pts = [p for p in px1s[a] if p[0] >= time.time() - 900]
+    r = [(math.log(p1 / p0)) ** 2 / (t1 - t0) for (t0, p0), (t1, p1) in zip(pts, pts[1:]) if t1 > t0 and p0 > 0 and p1 > 0]
+    if len(r) < 30:
+        return 6e-5
+    return max(2e-5, math.sqrt(sum(r) / len(r)))
 
 
-def ref_handle(src, raw):
-    now = time.time()
-    if raw_seen[src] < 30:                                 # keep the first messages for debugging
-        raw_seen[src] += 1
-        try:
-            db_exec("INSERT INTO raw VALUES (?,?,?)", (now, src, str(raw)[:3000]))
-        except Exception:
-            pass
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return
-    if isinstance(data, dict) and data.get("op") == "authed":
-        stats[f"{src}_state"] = "authed"
-    pts = []
-    ref_points(data, pts)
-    if pts:
-        stats[f"{src}_msgs"] += 1
-        stats[f"{src}_state"] = "streaming"
-        with lock:
-            for a, t, v in pts:
-                dq = ref[src][a]
-                if t > 0 and (not dq or t > dq[-1][0]):
-                    dq.append((t, v, now))
-
-
-def api_creds():
-    k, s, p = (os.environ.get(x) for x in ("POLY_API_KEY", "POLY_API_SECRET", "POLY_API_PASSPHRASE"))
-    if k and s and p:
-        return k, s, p
-    pk = os.environ.get("POLY_PRIVATE_KEY")
-    if not pk:
+def fair_up(a, tf, open_ts, now, px):
+    op = opens.get((a, tf, open_ts))
+    left = close_of(tf, open_ts) - now
+    if not op or not px or left <= 0:
         return None
-    errs = []
-    for modname in ("py_clob_client.client", "py_clob_client_v2.client", "py_clob_client_v2"):
-        try:
-            mod = __import__(modname, fromlist=["ClobClient"])
-            c = mod.ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
-            cr = c.create_or_derive_api_creds()
-            k = getattr(cr, "api_key", None) or (cr.get("apiKey") if isinstance(cr, dict) else None)
-            s_ = getattr(cr, "api_secret", None) or (cr.get("secret") if isinstance(cr, dict) else None)
-            p_ = getattr(cr, "api_passphrase", None) or (cr.get("passphrase") if isinstance(cr, dict) else None)
-            if k and s_ and p_:
-                return k, s_, p_
-            errs.append(f"{modname}: no creds in reply")
-        except Exception as e:
-            errs.append(f"{modname}: {e}")
-    log.error(f"could not derive API credentials: {' | '.join(errs)}")
-    stats["v2_err"] = errs[-1][:120] if errs else ""
-    return None
+    return 100.0 * norm_cdf(math.log(px / op) / (sigma(a) * math.sqrt(left)))
 
 
-def v2_worker():
-    creds = api_creds()
-    if not creds:
-        stats["v2_state"] = "no credentials"
-        return
-    subs = [{"channel": "price.crypto", "filter": {"symbol": f"{a.lower()}usd"}} for a in ASSETS]
-    while True:
-        try:
-            stats["v2_state"] = "connecting"
-
-            def on_open(ws):
-                ws.send(json.dumps({"op": "auth", "rid": "a1",
-                                    "auth": {"apiKey": creds[0], "secret": creds[1], "passphrase": creds[2]}}))
-
-            def on_message(ws, msg):
-                try:
-                    d = json.loads(msg)
-                    if isinstance(d, dict) and d.get("op") == "authed":
-                        ws.send(json.dumps({"op": "subscribe", "rid": "s1", "subscriptions": subs}))
-                except Exception:
-                    pass
-                ref_handle("v2", msg)
-
-            ws = websocket.WebSocketApp(RTDS_V2, on_open=on_open, on_message=on_message)
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as e:
-            log.warning(f"v2: {e}")
-        stats["v2_state"] = "reconnecting"
-        time.sleep(5)
-
-
-def v1_worker():
-    subs = [{"topic": "crypto_prices_chainlink", "type": "*", "filters": json.dumps({"symbol": f"{a.lower()}/usd"})}
-            for a in ASSETS]
-    while True:
-        try:
-            stats["v1_state"] = "connecting"
-            stop = threading.Event()
-
-            def on_open(ws):
-                ws.send(json.dumps({"action": "subscribe", "subscriptions": subs}))
-
-                def pinger():
-                    while not stop.is_set():
-                        time.sleep(5)
-                        try:
-                            ws.send("PING")
-                        except Exception:
-                            return
-                threading.Thread(target=pinger, daemon=True).start()
-
-            last = {"t": time.time()}
-
-            def on_message(ws, msg):
-                if msg in ("PONG", "pong", ""):
-                    return
-                last["t"] = time.time()
-                ref_handle("v1", msg)
-
-            ws = websocket.WebSocketApp(RTDS_V1, on_open=on_open, on_message=on_message)
-
-            def watchdog():
-                while not stop.is_set():
-                    time.sleep(2)
-                    if time.time() - last["t"] > V1_IDLE_SECS:     # quiet -> reconnect for a fresh snapshot
-                        stats["v1_reconnects"] = stats.get("v1_reconnects", 0) + 1
-                        try:
-                            ws.close()
-                        except Exception:
-                            pass
-                        return
-            threading.Thread(target=watchdog, daemon=True).start()
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-            stop.set()
-        except Exception as e:
-            log.warning(f"v1: {e}")
-        stats["v1_state"] = "reconnecting"
-        time.sleep(1)
-
-
-# ── sampling ────────────────────────────────────────────────────────────────
-def latest(dq):
-    return dq[-1] if dq else None
-
-
-def price_at(dq, t):
-    """value of the first point at or after time t (scans back from the newest point)"""
-    hit = None
-    for i in range(len(dq) - 1, -1, -1):
-        p = dq[i]
-        if p[0] < t:
-            break
-        hit = p[1]
-    return hit
-
-
-strikes = {}      # (src, asset, tf, open_ts) -> first price at/after the open
-
-
-def strike(src, a, tf, o):
-    k = (src, a, tf, o)
-    if k not in strikes:
-        dq = bn[a] if src == "bn" else ref[src][a]
-        if dq and dq[-1][0] >= o:
-            v = price_at(dq, o)
-            if v is not None and (not dq or dq[0][0] < o):   # only trust it if we saw the moment of the open
-                strikes[k] = v
-            elif v is not None:
-                strikes[k] = None
-        if len(strikes) > 5000:
-            for x in sorted(strikes, key=lambda z: z[3])[:2500]:
-                strikes.pop(x, None)
-    return strikes.get(k)
-
-
-def strike_worker():
-    """grab each window's opening price right after the open, while it's cheap to find"""
-    while True:
-        try:
-            now = time.time()
-            with lock:
-                for a in ASSETS:
-                    for tf in TFS:
-                        o = window(tf, now)[0]
-                        for src in ("v2", "v1", "bn"):
-                            strike(src, a, tf, o)
-        except Exception as e:
-            stats["errors"] += 1
-            log.error(f"strike: {e}")
-        time.sleep(0.2)
-
-
-def best(tok, kind):
-    b = books.get(tok)
+# ── snapshots ───────────────────────────────────────────────────────────────
+def _best(b, kind):
     if not b or not b[kind]:
         return None
     return max(b[kind]) if kind == "bids" else min(b[kind])
 
 
-def ask_usd(tok, a, cents=2.0):
-    b = books.get(tok)
-    if not b or a is None:
+def _depth(b, best, cents=2.0):
+    if not b or best is None:
         return None
-    return round(sum(px * sz / 100.0 for px, sz in b["asks"].items() if px <= a + cents + 1e-9), 2)
+    return round(sum(px * sz / 100.0 for px, sz in b["asks"].items() if px <= best + cents + 1e-9), 2)
 
 
-seen_windows = set()
+def _ladder(bu, bd, n=6):
+    def lv(b, kind):
+        if not b or not b[kind]:
+            return []
+        return [[k, round(b[kind][k], 1)] for k in sorted(b[kind], reverse=(kind == "bids"))[:n]]
+    return json.dumps({"ua": lv(bu, "asks"), "ub": lv(bu, "bids"), "da": lv(bd, "asks"), "db": lv(bd, "bids")},
+                      separators=(",", ":"))
 
 
-def sampler():
-    buf, last_flush = [], time.time()
+def books_now(a, now):
+    out = []
+    with lock:
+        for (a2, tf, o), (u, d) in markets.items():
+            if a2 != a or not (o <= now < close_of(tf, o)):
+                continue
+            bu, bd = books.get(u), books.get(d)
+            ua, da = _best(bu, "asks"), _best(bd, "asks")
+            out.append((tf, o, _best(bu, "bids"), ua, _best(bd, "bids"), da, _depth(bu, ua), _depth(bd, da),
+                        _ladder(bu, bd)))
+    return out
+
+
+def jl_worker():
     while True:
         try:
-            t0 = time.time()
-            with lock:
-                for a in ASSETS:
-                    for tf in TFS:
-                        o, c, left = window(tf, t0)
-                        if left > LAST_SECS:
-                            continue
-                        mk = markets.get((a, tf, o))
-                        if not mk:
-                            continue
-                        seen_windows.add((a, tf, o))
-                        up, dn = mk
-                        ua, da = best(up, "asks"), best(dn, "asks")
-                        r2, r1, b = latest(ref["v2"][a]), latest(ref["v1"][a]), latest(bn[a])
-                        buf.append((t0, a, tf, o, round(left, 2),
-                                    r2[1] if r2 else None, round(t0 - r2[0], 2) if r2 else None,
-                                    r1[1] if r1 else None, round(t0 - r1[0], 2) if r1 else None,
-                                    b[1] if b else None,
-                                    strikes.get(("v2", a, tf, o)), strikes.get(("v1", a, tf, o)), strikes.get(("bn", a, tf, o)),
-                                    best(up, "bids"), ua, best(dn, "bids"), da, ask_usd(up, ua), ask_usd(dn, da)))
-            if buf and time.time() - last_flush >= 2:
-                db_exec("INSERT INTO samples VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", buf, many=True)
-                stats["samples"] += len(buf)
-                buf, last_flush = [], time.time()
-            time.sleep(max(0.0, SAMPLE_SECS - (time.time() - t0)))
+            time.sleep(0.02)
+            now = time.time()
+            with jlock:
+                todo = []
+                for ev in pending:
+                    for off in JL_OFFSETS:
+                        if off not in ev["done"] and now >= ev["t0"] + off:
+                            ev["done"].add(off)
+                            todo.append((ev, off))
+                pending[:] = [e for e in pending if len(e["done"]) < len(JL_OFFSETS)]
+            if not todo:
+                continue
+            rows, cache = [], {}
+            for ev, off in todo:
+                a = ev["asset"]
+                if a not in cache:
+                    cache[a] = (prices.get(a), books_now(a, now))
+                px, bks = cache[a]
+                for tf, o, ub, ua, dbid, da, uad, dad, lad in bks:
+                    fu = fair_up(a, tf, o, ev["t0"], px) if off == 0 else None
+                    rows.append((ev["id"], ev["t0"], ev["bps"], tf, o, off, round(now - ev["t0"], 3), px,
+                                 ub, ua, dbid, da, round(close_of(tf, o) - ev["t0"], 1),
+                                 round(fu, 2) if fu is not None else None, uad, dad, a, lad,
+                                 opens.get((a, tf, o))))
+            if rows:
+                db_exec("INSERT INTO lj_jumps (jid,t0,bps,tf,open_ts,off,real_dt,btc,up_bid,up_ask,dn_bid,dn_ask,"
+                        "secs_left,fair_up,up_ask_usd,dn_ask_usd,asset,ladder,strike) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows, many=True)
+                stats["rows"] += len(rows)
         except Exception as e:
             stats["errors"] += 1
-            log.error(f"sampler: {e}")
+            log.error(f"jl: {e}")
             time.sleep(1)
 
 
-def settler():
-    while True:
-        try:
-            now = time.time()
-            for k in sorted(seen_windows):
-                a, tf, o = k
-                c = o + tf * 60
-                if now < c + 45:
-                    continue
-                oc = outcome(a, tf, o)
-                if oc is None and now < c + 3600:
-                    continue
-                with lock:
-                    vals = (strikes.get(("v2", a, tf, o)), price_at(ref["v2"][a], c),
-                            strikes.get(("v1", a, tf, o)), price_at(ref["v1"][a], c),
-                            strikes.get(("bn", a, tf, o)), price_at(bn[a], c))
-                db_exec("INSERT OR REPLACE INTO mkts VALUES (?,?,?,?,?,?,?,?,?,?)", (a, tf, o, oc or "VOID") + vals)
-                seen_windows.discard(k)
-            cut = now - KEEP_DAYS * 86400
-            if int(now) % 3600 < 31:
-                db_exec("DELETE FROM samples WHERE ts < ?", (cut,))
-        except Exception as e:
-            stats["errors"] += 1
-            log.error(f"settler: {e}")
-        time.sleep(30)
+# ── /jumps ──────────────────────────────────────────────────────────────────
+VERS = [("every jump", lambda x, e, g: True),
+        ("calm 5+ min + <85c", lambda x, e, g: g > 300 and x < 85),
+        ("edge 10+ + <85c", lambda x, e, g: e is not None and e >= 10 and x < 85),
+        ("edge 20+", lambda x, e, g: e is not None and e >= 20)]
 
 
-# ── report ──────────────────────────────────────────────────────────────────
-def pred(o, c):
-    if o is None or c is None:
-        return None
-    return "UP" if c >= o else "DOWN"
-
-
-def cl_text():
+def jumps_text():
     now = time.time()
-    L = [f"🔗 <b>FINAL-MINUTE LOGGER</b> · {','.join(ASSETS)} {'/'.join(f'{t}m' for t in TFS)} · last {LAST_SECS:g}s",
-         f"feeds: ref v2 {stats['v2_state']} ({stats['v2_msgs']} msgs{' · ' + stats['v2_err'] if stats.get('v2_err') else ''}) · "
-         f"ref v1 {stats['v1_state']} ({stats['v1_msgs']} msgs, {stats.get('v1_reconnects', 0)} refreshes) · "
-         f"binance {stats['bn_msgs']} · book msgs {stats['pm_msgs']} · samples {stats['samples']} · errors {stats['errors']}"]
-    for src in ("v2", "v1"):
-        for a in ASSETS:
-            p = latest(ref[src][a])
-            if p:
-                L.append(f"  {src} {a}: {p[1]:,.2f} (age {now - p[0]:.1f}s, arrives {p[2] - p[0]:+.2f}s after its timestamp)")
-    rows = db_query("SELECT * FROM mkts WHERE outcome != 'VOID'")
+    with lock:
+        nm = len(markets)
+    L = [f"⚡ <b>LONG-MARKET JUMP LOGGER</b> · {','.join(ASSETS)} {'/'.join(label(t) for t in TFS)} · "
+         f"moves ≥{JL_BPS:g}bp in {JL_WINDOW:g}s",
+         f"up {(now - stats['started']) / 3600:.1f}h · markets watched {nm} · binance {stats['bn_msgs']} · "
+         f"book msgs {stats['pm_msgs']} · errors {stats['errors']}",
+         "jumps since restart: " + " · ".join(f"{a} {n}" for a, n in stats["jumps"].items())]
+    rows = db_query("SELECT * FROM lj_jumps WHERE t0 >= ? ORDER BY jid, tf, off", (now - 86400,))
     if not rows:
-        L.append("no settled markets yet")
+        L.append("no jumps logged yet")
         return "\n".join(L)
-    for lab, oc, cc in (("ref v2", "v2_open", "v2_close"), ("ref v1", "v1_open", "v1_close"), ("Binance", "bn_open", "bn_close")):
-        ok = [r for r in rows if pred(r[oc], r[cc])]
-        if ok:
-            m = sum(1 for r in ok if pred(r[oc], r[cc]) == r["outcome"])
-            L.append(f"{lab} open→close says the winner: {m}/{len(ok)} ({100 * m / len(ok):.1f}%)")
-    # paper edge: in the final 30s, buy the side the reference price says is winning, at the ask, when
-    # the market still prices it at <= 90c (i.e. the book disagrees / is slow). Once per market.
-    src = "ref_v2" if any(r["v2_open"] for r in rows) else "ref_v1"
-    strike = "strike_v2" if src == "ref_v2" else "strike_v1"
-    out = {(r["asset"], r["tf"], r["open_ts"]): r["outcome"] for r in rows}
-    S = db_query(f"SELECT asset, tf, open_ts, secs_left, {src} AS px, {strike} AS k, up_ask, dn_ask, up_ask_usd, dn_ask_usd "
-                 f"FROM samples WHERE secs_left <= 30 AND {src} IS NOT NULL AND {strike} IS NOT NULL ORDER BY ts")
-    done, n, w, pnl = set(), 0, 0, 0.0
-    for s in S:
-        k = (s["asset"], s["tf"], s["open_ts"])
-        if k in done or k not in out:
+    ev = {}
+    for r in rows:
+        ev.setdefault((r["asset"], r["jid"], r["tf"]), {})[r["off"]] = r
+    t0s = {}
+    for (a, jid, tf), s in ev.items():
+        if 0.0 in s:
+            t0s.setdefault(a, set()).add((s[0.0]["t0"], jid))
+    gaps = {}
+    for a, s in t0s.items():
+        prev = None
+        for t0, jid in sorted(s):
+            gaps[(a, jid)] = (t0 - prev) if prev is not None else 99999
+            prev = t0
+    tot = {}
+    for (a, jid, tf), s in ev.items():
+        a_s, b_s, z_s = s.get(0.25), s.get(5.0), s.get(0.0)
+        if not a_s or not b_s or not z_s:
             continue
-        side = "UP" if s["px"] >= s["k"] else "DOWN"
-        a = s["up_ask"] if side == "UP" else s["dn_ask"]
-        if a is None or not (5 <= a <= 90):
+        up = a_s["bps"] > 0
+        x = a_s["up_ask"] if up else a_s["dn_ask"]
+        b = b_s["up_bid"] if up else b_s["dn_bid"]
+        dep = a_s["up_ask_usd"] if up else a_s["dn_ask_usd"]
+        if x is None or b is None or not (5 <= x <= 95):
             continue
-        dep = s["up_ask_usd"] if side == "UP" else s["dn_ask_usd"]
-        stake = min(STAKE, dep) if dep else STAKE
-        sh = stake / (a / 100)
-        win = out[k] == side
-        pnl += (sh if win else 0) - stake - fee(sh, a / 100)
-        n, w = n + 1, w + win
-        done.add(k)
-    L.append(f"paper edge (last 30s, buy the side {src} says wins when it's ≤90¢, ${STAKE:g}): "
-             f"{n} trades · {w} wins · {money(pnl)}")
+        fu = z_s["fair_up"]
+        e = None if fu is None else (fu if up else 100 - fu) - x
+        g = gaps.get((a, jid), 99999)
+        st = min(JL_STAKE, dep) if dep else JL_STAKE
+        sh = st / (x / 100.0)
+        pnl = sh * b / 100.0 - st - fee(sh, x / 100.0) - fee(sh, b / 100.0)
+        for k, f in VERS:
+            if f(x, e, g):
+                t = tot.setdefault((a, tf, k), [0.0, 0, 0])
+                t[0] += pnl
+                t[1] += 1
+                t[2] += pnl > 0
+    L.append(f"<b>paper sniper</b> · last 24h · buy at +0.25s ask, sell at +5s bid, ${JL_STAKE:g}, after fees:")
+    for a in ASSETS:
+        for tf in TFS:
+            if not any((a, tf, k) in tot for k, _ in VERS):
+                continue
+            L.append(f"{a} {label(tf)}: " + " · ".join(
+                f"{k} {n} tr {money(v)}" + (f" ({w * 100 // n}% win)" if n else "")
+                for k, _ in VERS for v, n, w in [tot.get((a, tf, k), [0.0, 0, 0])]))
     return "\n".join(L)
 
 
+# ── old data kept in the same database ──────────────────────────────────────
 OLD_TABLES = {"/export": ("trades", "lastmin_trades.csv.gz"), "/exporttrail": ("trail", "trail_trades.csv.gz"),
               "/exportsnaps": ("snaps", "lastmin_snaps.csv.gz")}
 
 
 def old_export(cmd):
-    """data left by the old paper last-minute bot (same DB file) - read only"""
     have = {r[0] for r in db_query("SELECT name FROM sqlite_master WHERE type='table'")}
+    if cmd == "/clexport":
+        sent = False
+        for tb, name in (("samples", "fm_samples.csv.gz"), ("mkts", "fm_mkts.csv.gz")):
+            if tb in have:
+                rows = db_query(f"SELECT * FROM {tb}")
+                if rows:
+                    tg_document(name, rows_csv_gz(rows), f"{len(rows)} rows (old final-minute logger)")
+                    sent = True
+        if not sent:
+            tg("no final-minute data in this database")
+        return
     if cmd == "/oldstats":
-        L = ["📦 <b>old last-minute paper bot</b> (data kept in the database)"]
-        for tb, lab in (("trades", "leader"), ("trail", "trailing side"), ("snaps", "snapshots")):
-            if tb not in have:
-                L.append(f"{lab}: no table")
-                continue
-            if tb == "snaps":
-                n = db_query("SELECT COUNT(*) FROM snaps")[0][0]
-                L.append(f"{lab}: {n} rows")
-                continue
-            cols = {r[1] for r in db_query(f"PRAGMA table_info({tb})")}
-            pcol = "pnl_net" if "pnl_net" in cols else None
-            n = db_query(f"SELECT COUNT(*) FROM {tb}")[0][0]
-            if pcol:
-                r = db_query(f"SELECT COUNT(*), SUM(result='WIN'), SUM({pcol}) FROM {tb} WHERE result IN ('WIN','LOSS')")[0]
-                L.append(f"{lab}: {n} rows · settled {r[0]} · wins {r[1] or 0} · net {money(r[2] or 0)}")
-            else:
-                L.append(f"{lab}: {n} rows")
+        L = ["📦 <b>old bots' data</b> (kept in the database)"]
+        for tb in ("trades", "trail", "snaps", "samples", "mkts"):
+            L.append(f"{tb}: {db_query(f'SELECT COUNT(*) FROM {tb}')[0][0] if tb in have else 'no table'} rows")
         tg("\n".join(L))
         return
     tb, name = OLD_TABLES[cmd]
@@ -707,28 +599,24 @@ def telegram_worker():
                 if str(msg.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                     continue
                 t = (msg.get("text") or "").strip().split()[0].lower() if msg.get("text") else ""
-                if t == "/cl":
-                    tg(cl_text())
-                elif t == "/clexport":
-                    s = db_query("SELECT * FROM samples ORDER BY ts")
-                    m = db_query("SELECT * FROM mkts ORDER BY open_ts")
-                    raw = db_query("SELECT * FROM raw ORDER BY ts")
-                    if s:
-                        tg_document("fm_samples.csv.gz", rows_csv_gz(s), f"{len(s)} samples")
+                if t == "/jumps":
+                    tg(jumps_text())
+                elif t == "/jumpexport":
+                    j = db_query("SELECT * FROM lj_jumps ORDER BY jid, tf, off")
+                    m = db_query("SELECT * FROM lj_mkts ORDER BY open_ts")
+                    if j:
+                        tg_document("lj_jumps.csv.gz", rows_csv_gz(j), f"{len(j)} jump snapshots (1h/4h/1d)")
                     if m:
-                        tg_document("fm_mkts.csv.gz", rows_csv_gz(m), f"{len(m)} settled markets")
-                    if raw:
-                        tg_document("fm_raw.csv.gz", rows_csv_gz(raw), "first raw messages per feed")
-                    if not s and not m:
-                        tg("nothing logged yet")
-                elif t in ("/export", "/exporttrail", "/exportsnaps", "/oldstats"):
+                        tg_document("lj_mkts.csv.gz", rows_csv_gz(m), f"{len(m)} markets with start price + outcome")
+                    if not j and not m:
+                        tg("no jumps logged yet")
+                elif t in ("/clexport", "/export", "/exporttrail", "/exportsnaps", "/oldstats"):
                     old_export(t)
                 elif t in ("/help", "/start"):
-                    tg("🔗 final-minute logger (paper, no orders)\n/cl — status + match rates + paper edge\n"
-                       "/clexport — raw data (gz CSV)\n"
-                       "old last-minute paper bot data (kept in the same database):\n"
-                       "/oldstats — its totals · /export — leader trades · /exporttrail — trailing-side trades · "
-                       "/exportsnaps — timing snapshots")
+                    tg("⚡ long-market jump logger (paper, no orders)\n"
+                       "/jumps — paper sniper per coin per market length (last 24h)\n"
+                       "/jumpexport — raw jump snapshots + outcomes (gz CSV)\n"
+                       "old data: /clexport (final-minute logger) · /oldstats · /export · /exporttrail · /exportsnaps")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
@@ -736,15 +624,11 @@ def telegram_worker():
 
 def main():
     init_db()
-    for fn in (resolver_worker, pm_worker, bn_worker, strike_worker, sampler, settler, telegram_worker):
+    for fn in (resolver_worker, pm_worker, bn_worker, jl_worker, settler, telegram_worker):
         threading.Thread(target=fn, daemon=True).start()
-    if RTDS_MODE in ("both", "v2"):
-        threading.Thread(target=v2_worker, daemon=True).start()
-    if RTDS_MODE in ("both", "v1"):
-        threading.Thread(target=v1_worker, daemon=True).start()
-    log.info(f"final-minute logger ON: {ASSETS} {TFS} last {LAST_SECS}s every {SAMPLE_SECS}s, ref {RTDS_MODE}")
-    tg(f"🔗 final-minute logger started ({','.join(ASSETS)} {'/'.join(f'{t}m' for t in TFS)}, paper, no orders). "
-       f"Send /cl in ~30 min.")
+    log.info(f"long-market jump logger ON: {ASSETS} {TFS} ≥{JL_BPS}bp in {JL_WINDOW}s")
+    tg(f"⚡ long-market jump logger started ({','.join(ASSETS)} {'/'.join(label(t) for t in TFS)}, paper, "
+       f"no orders). Send /jumps in a few hours.")
     while True:
         time.sleep(60)
 
