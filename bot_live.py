@@ -8,9 +8,16 @@
 # 2, 5 and 10 seconds (best bid/ask both sides, $ on offer, top 6 levels) plus the model
 # fair price at the jump. Settled outcomes are logged too, so "hold to the end" can be checked.
 #
+# DIP LOGGER (added Oct 26 8:30pm): watches the same coins' 5m/15m/1h/4h/daily books for sudden dumps -
+# a side's best bid drops >= DIP_CENTS within DIP_WINDOW seconds while the coin itself is flat on Binance
+# (moved < DIP_FLAT_BPS). Each dip is snapshotted at +0 .. +30s (both sides, top 6 levels, fair price,
+# $ of trades in the window) to test "buy the dip, sell the bounce a few seconds later".
+#
 # Commands (Telegram, this bot's own token):
 #   /jumps        paper sniper versions per coin per market length (last 24h)
 #   /jumpexport   raw jump snapshots + settled outcomes (gzipped CSV)
+#   /dips         paper dip-buyer versions (last 24h)
+#   /dipexport    raw dip snapshots (gzipped CSV)
 #   /clexport     the old final-minute logger data (kept in the same database)
 #   /oldstats /export /exporttrail /exportsnaps   data from the older last-minute bot
 #   /help
@@ -29,7 +36,14 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 DB_PATH = os.environ.get("DB_PATH", "final_minute.db")
 ASSETS = [a.strip().upper() for a in os.environ.get("ASSETS", "BTC,ETH,SOL").split(",") if a.strip()]
-TFS = [int(x) for x in os.environ.get("TFS", "60,240,1440").split(",") if x.strip()]
+TFS = [int(x) for x in os.environ.get("TFS", "60,240,1440").split(",") if x.strip()]          # jump logger
+DIP_TFS = [int(x) for x in os.environ.get("DIP_TFS", "5,15,60,240,1440").split(",") if x.strip()]  # dip logger
+ALL_TFS = sorted(set(TFS) | set(DIP_TFS))
+DIP_CENTS = float(os.environ.get("DIP_CENTS", "5"))
+DIP_WINDOW = float(os.environ.get("DIP_WINDOW", "2"))
+DIP_FLAT_BPS = float(os.environ.get("DIP_FLAT_BPS", "1.5"))
+DIP_COOLDOWN = float(os.environ.get("DIP_COOLDOWN", "30"))
+DIP_OFFSETS = (0.0, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
 JL_BPS = float(os.environ.get("JL_BPS", "5"))
 JL_WINDOW = float(os.environ.get("JL_WINDOW", "2"))
 JL_COOLDOWN = float(os.environ.get("JL_COOLDOWN", "10"))
@@ -60,7 +74,12 @@ px1s = {a: deque(maxlen=1200) for a in ASSETS}      # (ts, px) ~1/s, for the vol
 opens = {}                        # (asset, tf, open_ts) -> window start price
 last_jump = {a: 0.0 for a in ASSETS}
 pending = []
-stats = {"bn_msgs": 0, "pm_msgs": 0, "jumps": {a: 0 for a in ASSETS}, "rows": 0, "errors": 0,
+trades = {}                       # token -> deque[(ts, price_c, size, side)] from last_trade_price
+bid_hist = {}                     # token -> deque[(ts, best_bid)] sampled every 0.1s
+dip_last = {}                     # token -> time of last dip
+book_reset = {}                   # token -> time of the last full book snapshot (resubscribe)
+dip_pending = []
+stats = {"dips": 0, "bn_msgs": 0, "pm_msgs": 0, "jumps": {a: 0 for a in ASSETS}, "rows": 0, "errors": 0,
          "started": time.time()}
 
 
@@ -91,6 +110,11 @@ def init_db():
             dn_ask REAL, secs_left REAL, fair_up REAL, up_ask_usd REAL, dn_ask_usd REAL, asset TEXT,
             ladder TEXT, strike REAL)""")
         c.execute("CREATE INDEX IF NOT EXISTS lj_t0 ON lj_jumps(t0)")
+        c.execute("""CREATE TABLE IF NOT EXISTS lj_dips (did INTEGER, t0 REAL, asset TEXT, tf INTEGER,
+            open_ts INTEGER, side TEXT, drop_c REAL, bid_before REAL, coin_bps REAL, sell_usd REAL, buy_usd REAL,
+            off REAL, real_dt REAL, coin REAL, up_bid REAL, up_ask REAL, dn_bid REAL, dn_ask REAL,
+            secs_left REAL, fair_up REAL, up_ask_usd REAL, dn_ask_usd REAL, ladder TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS ld_t0 ON lj_dips(t0)")
         c.execute("""CREATE TABLE IF NOT EXISTS lj_mkts (asset TEXT, tf INTEGER, open_ts INTEGER, outcome TEXT,
             strike REAL, PRIMARY KEY (asset, tf, open_ts))""")
         c.commit()
@@ -241,7 +265,7 @@ def resolver_worker():
         try:
             now = time.time()
             for a in ASSETS:
-                for tf in TFS:
+                for tf in ALL_TFS:
                     cur = window(tf, now)[0]
                     if now >= cur + 60:
                         fetch_open(a, tf, cur)
@@ -278,6 +302,7 @@ def settler():
                     db_exec("UPDATE lj_mkts SET outcome=? WHERE asset=? AND tf=? AND open_ts=?",
                             (o, r["asset"], r["tf"], r["open_ts"]))
             db_exec("DELETE FROM lj_jumps WHERE t0 < ?", (now - KEEP_DAYS * 86400,))
+            db_exec("DELETE FROM lj_dips WHERE t0 < ?", (now - KEEP_DAYS * 86400,))
         except Exception as e:
             log.warning(f"settler: {e}")
         time.sleep(120)
@@ -297,8 +322,17 @@ def pm_handle(raw):
         with lock:
             if et == "book":
                 tok = str(m.get("asset_id"))
+                book_reset[tok] = time.time()
                 books[tok] = {"bids": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("bids") or m.get("buys") or [])},
                               "asks": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("asks") or m.get("sells") or [])}}
+            elif et == "last_trade_price":
+                try:
+                    tok = str(m.get("asset_id"))
+                    trades.setdefault(tok, deque(maxlen=500)).append(
+                        (time.time(), round(float(m["price"]) * 100, 3), float(m.get("size", 0)),
+                         str(m.get("side", "")).upper()))
+                except Exception:
+                    pass
             elif et == "price_change":
                 for ch in (m.get("price_changes") or m.get("changes") or []):
                     tok = str(ch.get("asset_id") or m.get("asset_id"))
@@ -438,7 +472,7 @@ def books_now(a, now):
     out = []
     with lock:
         for (a2, tf, o), (u, d) in markets.items():
-            if a2 != a or not (o <= now < close_of(tf, o)):
+            if a2 != a or tf not in TFS or not (o <= now < close_of(tf, o)):
                 continue
             bu, bd = books.get(u), books.get(d)
             ua, da = _best(bu, "asks"), _best(bd, "asks")
@@ -483,6 +517,153 @@ def jl_worker():
             stats["errors"] += 1
             log.error(f"jl: {e}")
             time.sleep(1)
+
+
+# ── dips ────────────────────────────────────────────────────────────────────
+def coin_move_bps(a, secs):
+    with jlock:
+        dq = ticks[a]
+        if not dq:
+            return None
+        now_px = dq[-1][1]
+        old = [p for ts, p in dq if ts >= time.time() - secs]
+        if not old:
+            return 0.0
+        return (now_px / old[0] - 1) * 1e4
+
+
+def trade_usd(tok, since):
+    s = b = 0.0
+    for ts, px, sz, side in list(trades.get(tok, ())):
+        if ts >= since:
+            if side == "SELL":
+                s += px * sz / 100
+            else:
+                b += px * sz / 100
+    return round(s, 2), round(b, 2)
+
+
+def dip_snapshot(ev, off, now):
+    a, tf, o = ev["asset"], ev["tf"], ev["open_ts"]
+    with lock:
+        t = markets.get((a, tf, o))
+        if not t:
+            return None
+        bu, bd = books.get(t[0]), books.get(t[1])
+        ua, da = _best(bu, "asks"), _best(bd, "asks")
+        row = (_best(bu, "bids"), ua, _best(bd, "bids"), da, _depth(bu, ua), _depth(bd, da), _ladder(bu, bd))
+    px = prices.get(a)
+    fu = fair_up(a, tf, o, ev["t0"], px) if off == 0 else None
+    return (ev["id"], ev["t0"], a, tf, o, ev["side"], ev["drop"], ev["before"], ev["bps"], ev["sell"], ev["buy"],
+            off, round(now - ev["t0"], 3), px) + row[:4] + (round(close_of(tf, o) - ev["t0"], 1),
+            round(fu, 2) if fu is not None else None) + row[4:]
+
+
+def dip_worker():
+    last_sample = 0.0
+    while True:
+        try:
+            time.sleep(0.02)
+            now = time.time()
+            if now - last_sample >= 0.1:                      # sample best bids, look for sudden drops
+                last_sample = now
+                found = []
+                with lock:
+                    live = [(k, t) for k, t in markets.items()
+                            if k[1] in DIP_TFS and k[2] <= now < close_of(k[1], k[2])]
+                    for (a, tf, o), (u, d) in live:
+                        for side, tok in (("UP", u), ("DOWN", d)):
+                            bb = _best(books.get(tok), "bids")
+                            h = bid_hist.setdefault(tok, deque(maxlen=200))
+                            if bb is None or now - book_reset.get(tok, 0) < 3:
+                                h.clear()                     # ignore jumps caused by a fresh book snapshot
+                                continue
+                            h.append((now, bb))
+                            while h and h[0][0] < now - DIP_WINDOW:
+                                h.popleft()
+                            hi = max(x for _, x in h)
+                            if hi - bb >= DIP_CENTS and 5 <= bb <= 95 and now - dip_last.get(tok, 0) >= DIP_COOLDOWN:
+                                found.append((a, tf, o, side, tok, hi, bb))
+                for a, tf, o, side, tok, hi, bb in found:
+                    mv = coin_move_bps(a, DIP_WINDOW + 0.5)
+                    if mv is None or abs(mv) >= DIP_FLAT_BPS:
+                        continue                              # the coin moved: real news, not a dump
+                    dip_last[tok] = now
+                    stats["dips"] += 1
+                    sell, buy = trade_usd(tok, now - DIP_WINDOW - 0.5)
+                    dip_pending.append({"id": int(now * 1000) * 10 + len(dip_pending) % 10, "t0": now, "asset": a,
+                                        "tf": tf, "open_ts": o, "side": side, "drop": round(hi - bb, 2),
+                                        "before": hi, "bps": round(mv, 2), "sell": sell, "buy": buy,
+                                        "done": set()})
+            todo = []
+            for ev in dip_pending:
+                for off in DIP_OFFSETS:
+                    if off not in ev["done"] and now >= ev["t0"] + off:
+                        ev["done"].add(off)
+                        todo.append((ev, off))
+            dip_pending[:] = [e for e in dip_pending if len(e["done"]) < len(DIP_OFFSETS)]
+            rows = [r for r in (dip_snapshot(ev, off, now) for ev, off in todo) if r]
+            if rows:
+                db_exec("INSERT INTO lj_dips (did,t0,asset,tf,open_ts,side,drop_c,bid_before,coin_bps,sell_usd,buy_usd,"
+                        "off,real_dt,coin,up_bid,up_ask,dn_bid,dn_ask,secs_left,fair_up,up_ask_usd,dn_ask_usd,ladder) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows, many=True)
+        except Exception as e:
+            stats["errors"] += 1
+            log.error(f"dip: {e}")
+            time.sleep(1)
+
+
+def dips_text():
+    now = time.time()
+    L = [f"📉 <b>DIP LOGGER</b> · {','.join(ASSETS)} {'/'.join(label(t) for t in DIP_TFS)} · bid drops "
+         f"≥{DIP_CENTS:g}¢ in {DIP_WINDOW:g}s while the coin moves <{DIP_FLAT_BPS:g}bp",
+         f"dips since restart: {stats['dips']}"]
+    rows = db_query("SELECT * FROM lj_dips WHERE t0 >= ? ORDER BY did, off", (now - 86400,))
+    if not rows:
+        L.append("no dips logged yet")
+        return "\n".join(L)
+    ev = {}
+    for r in rows:
+        ev.setdefault(r["did"], {})[r["off"]] = r
+    vers = [("every dip", lambda e, s: True), ("edge 10+", lambda e, s: e is not None and e >= 10),
+            ("real dump ($50+ sold)", lambda e, s: s >= 50),
+            ("edge 10+ & $50+ sold", lambda e, s: e is not None and e >= 10 and s >= 50)]
+    tot = {}
+    for did, s in ev.items():
+        z, a_s = s.get(0.0), s.get(0.25)
+        if not z or not a_s:
+            continue
+        up = z["side"] == "UP"
+        x = a_s["up_ask"] if up else a_s["dn_ask"]
+        dep = a_s["up_ask_usd"] if up else a_s["dn_ask_usd"]
+        if x is None or not (5 <= x <= 95):
+            continue
+        fu = z["fair_up"]
+        e = None if fu is None else (fu if up else 100 - fu) - x
+        st = min(JL_STAKE, dep) if dep else JL_STAKE
+        sh = st / (x / 100.0)
+        for exit_off in (5.0, 30.0):
+            b_s = s.get(exit_off)
+            b = (b_s["up_bid"] if up else b_s["dn_bid"]) if b_s else None
+            if b is None:
+                continue
+            pnl = sh * b / 100.0 - st - fee(sh, x / 100.0) - fee(sh, b / 100.0)
+            for k, f in vers:
+                if f(e, z["sell_usd"] or 0):
+                    t = tot.setdefault((z["tf"], k, exit_off), [0.0, 0, 0])
+                    t[0] += pnl
+                    t[1] += 1
+                    t[2] += pnl > 0
+    L.append(f"<b>paper dip-buyer</b> · last 24h · buy the dipped side at the +0.25s ask, sell at the +5s / +30s bid, "
+             f"${JL_STAKE:g}, after fees:")
+    for tf in DIP_TFS:
+        for k, _ in vers:
+            a5, a30 = tot.get((tf, k, 5.0)), tot.get((tf, k, 30.0))
+            if a5 or a30:
+                L.append(f"{label(tf)} {k}: " + " · ".join(
+                    f"@{int(o)}s {n} tr {money(v)} ({w * 100 // n}% win)"
+                    for o, q in ((5, a5), (30, a30)) if q for v, n, w in [q]))
+    return "\n".join(L)
 
 
 # ── /jumps ──────────────────────────────────────────────────────────────────
@@ -610,12 +791,21 @@ def telegram_worker():
                         tg_document("lj_mkts.csv.gz", rows_csv_gz(m), f"{len(m)} markets with start price + outcome")
                     if not j and not m:
                         tg("no jumps logged yet")
+                elif t == "/dips":
+                    tg(dips_text())
+                elif t == "/dipexport":
+                    d = db_query("SELECT * FROM lj_dips ORDER BY did, off")
+                    if d:
+                        tg_document("lj_dips.csv.gz", rows_csv_gz(d), f"{len(d)} dip snapshots")
+                    else:
+                        tg("no dips logged yet")
                 elif t in ("/clexport", "/export", "/exporttrail", "/exportsnaps", "/oldstats"):
                     old_export(t)
                 elif t in ("/help", "/start"):
                     tg("⚡ long-market jump logger (paper, no orders)\n"
                        "/jumps — paper sniper per coin per market length (last 24h)\n"
                        "/jumpexport — raw jump snapshots + outcomes (gz CSV)\n"
+                       "/dips — paper dip-buyer (sudden dumps while the coin is flat) · /dipexport — raw dip snapshots\n"
                        "old data: /clexport (final-minute logger) · /oldstats · /export · /exporttrail · /exportsnaps")
         except Exception as e:
             log.warning(f"telegram: {e}")
@@ -624,11 +814,11 @@ def telegram_worker():
 
 def main():
     init_db()
-    for fn in (resolver_worker, pm_worker, bn_worker, jl_worker, settler, telegram_worker):
+    for fn in (resolver_worker, pm_worker, bn_worker, jl_worker, dip_worker, settler, telegram_worker):
         threading.Thread(target=fn, daemon=True).start()
     log.info(f"long-market jump logger ON: {ASSETS} {TFS} ≥{JL_BPS}bp in {JL_WINDOW}s")
-    tg(f"⚡ long-market jump logger started ({','.join(ASSETS)} {'/'.join(label(t) for t in TFS)}, paper, "
-       f"no orders). Send /jumps in a few hours.")
+    tg(f"⚡ long-market jump logger + 📉 dip logger started ({','.join(ASSETS)} · jumps {'/'.join(label(t) for t in TFS)}"
+       f" · dips {'/'.join(label(t) for t in DIP_TFS)}, paper, no orders). Send /jumps or /dips in a few hours.")
     while True:
         time.sleep(60)
 
