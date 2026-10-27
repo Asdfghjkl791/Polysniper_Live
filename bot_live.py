@@ -115,6 +115,12 @@ def init_db():
             off REAL, real_dt REAL, coin REAL, up_bid REAL, up_ask REAL, dn_bid REAL, dn_ask REAL,
             secs_left REAL, fair_up REAL, up_ask_usd REAL, dn_ask_usd REAL, ladder TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS ld_t0 ON lj_dips(t0)")
+        c.execute("""CREATE TABLE IF NOT EXISTS lj_opt (ts REAL, asset TEXT, date TEXT, expiry INTEGER, strike REAL,
+            yes_bid REAL, yes_ask REAL, no_bid REAL, no_ask REAL, yes_ask_usd REAL, no_ask_usd REAL, spot REAL,
+            iv REAL, deribit_p REAL, hours_left REAL, yes_tok TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS lo_ts ON lj_opt(ts)")
+        c.execute("""CREATE TABLE IF NOT EXISTS lj_opt_mkts (yes_tok TEXT PRIMARY KEY, asset TEXT, date TEXT,
+            expiry INTEGER, strike REAL, slug TEXT, question TEXT, outcome TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS lj_mkts (asset TEXT, tf INTEGER, open_ts INTEGER, outcome TEXT,
             strike REAL, PRIMARY KEY (asset, tf, open_ts))""")
         c.commit()
@@ -354,7 +360,7 @@ def pm_worker():
     while True:
         try:
             with lock:
-                toks = tuple(sorted(t for v in markets.values() for t in v))
+                toks = tuple(sorted({t for v in markets.values() for t in v} | set(opt_tokens())))
             if not toks:
                 time.sleep(2)
                 continue
@@ -377,7 +383,7 @@ def pm_worker():
                     return
                 pm_handle(msg)
                 with lock:
-                    cur = tuple(sorted(t for v in markets.values() for t in v))
+                    cur = tuple(sorted({t for v in markets.values() for t in v} | set(opt_tokens())))
                 if cur != toks:                     # new windows -> resubscribe
                     ws.close()
 
@@ -738,6 +744,267 @@ def jumps_text():
     return "\n".join(L)
 
 
+# ── OPTIONS GAP LOGGER ──────────────────────────────────────────────────────
+# Polymarket's daily "Will BTC/ETH be above $X on <date>?" ladders vs the chance implied by Deribit options.
+# Every OPT_SECS it logs, per strike: Polymarket YES/NO bid/ask/$ on offer + Deribit's probability that the
+# coin settles above the strike at the same time (noon ET, Binance 1m close). Paper only.
+OPT_ASSETS = [a.strip().upper() for a in os.environ.get("OPT_ASSETS", "BTC,ETH").split(",") if a.strip()]
+OPT_DAYS = int(os.environ.get("OPT_DAYS", "4"))          # look this many dates ahead
+OPT_SECS = float(os.environ.get("OPT_SECS", "60"))
+OPT_GAP = float(os.environ.get("OPT_GAP", "5"))          # /opt lists gaps at least this many cents
+DERIBIT = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
+opt_mk = {}            # yes_token -> dict(asset, date, strike, expiry, yes, no, slug, question)
+opt_state = {"events": 0, "markets": 0, "deribit_ok": {}, "rows": 0, "last": 0.0, "found": [], "err": ""}
+MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+          "november", "december"]
+
+
+def opt_tokens():
+    with lock:
+        return [t for v in opt_mk.values() for t in (v["yes"], v["no"])]
+
+
+def _strike_of(m):
+    for txt in (m.get("groupItemTitle") or "", m.get("question") or ""):
+        if re.search(r"between|range|\d\s*[-–]\s*\$?\d|\bto\b\s*\$|[<>]", txt, re.I) and "above" not in txt.lower():
+            return None
+        x = re.search(r"\$?\s*([\d][\d,]*\.?\d*)\s*([kK])?", txt.replace("↑", ""))
+        if x:
+            v = float(x.group(1).replace(",", ""))
+            if x.group(2):
+                v *= 1000
+            if v > 50:
+                return v
+    return None
+
+
+def opt_discover():
+    """find the 'above $X on <date>' events for the next OPT_DAYS dates"""
+    found = {}
+    today = datetime.now(ET).date()
+    for a in OPT_ASSETS:
+        name = FULLNAME[a]
+        for k in range(OPT_DAYS + 1):
+            d = today + timedelta(days=k)
+            mon = MONTHS[d.month - 1]
+            exp = int(datetime(d.year, d.month, d.day, 12, 0, tzinfo=ET).timestamp())
+            if exp < time.time() + 60:
+                continue
+            for sl in (f"{name}-above-on-{mon}-{d.day}", f"{name}-above-on-{mon}-{d.day}-{d.year}"):
+                try:
+                    arr = requests.get(f"{GAMMA}/events", params={"slug": sl}, timeout=10).json()
+                except Exception as e:
+                    opt_state["err"] = f"gamma: {e}"
+                    continue
+                ev = arr[0] if isinstance(arr, list) and arr else (arr if isinstance(arr, dict) else None)
+                if not ev or not ev.get("markets"):
+                    continue
+                for m in ev["markets"]:
+                    if m.get("closed"):
+                        continue
+                    k_ = _strike_of(m)
+                    try:
+                        toks = json.loads(m.get("clobTokenIds", "[]"))
+                    except Exception:
+                        toks = []
+                    ex = exp
+                    try:                               # use the market's own end time when it's near noon ET
+                        e2 = datetime.fromisoformat(str(m.get("endDate", "")).replace("Z", "+00:00")).timestamp()
+                        if abs(e2 - exp) <= 6 * 3600:
+                            ex = int(e2)
+                    except Exception:
+                        pass
+                    if k_ and len(toks) == 2:
+                        found[str(toks[0])] = dict(asset=a, date=d.isoformat(), strike=k_, expiry=ex, yes=str(toks[0]),
+                                                   no=str(toks[1]), slug=sl, question=(m.get("question") or "")[:120])
+                break
+    with lock:
+        opt_mk.clear()
+        opt_mk.update(found)
+    opt_state["markets"] = len(found)
+    opt_state["found"] = sorted({(v["asset"], v["date"]) for v in found.values()})
+
+
+def _deribit(a):
+    r = requests.get(DERIBIT, params={"currency": a, "kind": "option"}, timeout=15).json()
+    out = {}          # expiry_ts -> {"F": fwd, "smile": [(K, iv)]}
+    for x in r.get("result", []):
+        nm = x.get("instrument_name", "")
+        p = nm.split("-")
+        if len(p) != 4 or not x.get("mark_iv"):
+            continue
+        try:
+            e = datetime.strptime(p[1], "%d%b%y").replace(hour=8, tzinfo=ZoneInfo("UTC"))
+            K = float(p[2])
+        except Exception:
+            continue
+        # out-of-the-money side only (cleaner IVs)
+        F = float(x.get("underlying_price") or 0)
+        if F <= 0 or (p[3] == "C" and K < F) or (p[3] == "P" and K > F):
+            continue
+        o = out.setdefault(int(e.timestamp()), {"F": F, "smile": []})
+        o["smile"].append((K, float(x["mark_iv"]) / 100.0))
+    for o in out.values():
+        o["smile"].sort()
+    return out
+
+
+def _iv_at(smile, K):
+    if not smile:
+        return None
+    if K <= smile[0][0]:
+        return smile[0][1]
+    if K >= smile[-1][0]:
+        return smile[-1][1]
+    for (k0, v0), (k1, v1) in zip(smile, smile[1:]):
+        if k0 <= K <= k1:
+            return v0 + (v1 - v0) * (K - k0) / (k1 - k0)
+
+
+def _digital(F, K, T, iv, div):
+    """risk-neutral P(S_T > K) with smile correction: N(d2) + vega * dIV/dK (per unit F)"""
+    if T <= 0 or iv <= 0:
+        return 1.0 if F > K else 0.0
+    sT = iv * math.sqrt(T)
+    d1 = (math.log(F / K) + 0.5 * sT * sT) / sT
+    d2 = d1 - sT
+    p = norm_cdf(d2) - F * math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi) * math.sqrt(T) * div
+    return min(1.0, max(0.0, p))
+
+
+def deribit_prob(chain, K, exp_ts, now):
+    """P(above K at exp_ts) - total variance interpolated between the two Deribit expiries around exp_ts"""
+    if not chain:
+        return None, None
+    ex = sorted(chain)
+    T = (exp_ts - now) / (365.0 * 86400)
+    if T <= 0:
+        return None, None
+
+    def var_and_slope(e):
+        sm = chain[e]["smile"]
+        iv = _iv_at(sm, K)
+        h = K * 0.01
+        a_, b_ = _iv_at(sm, K - h), _iv_at(sm, K + h)
+        return iv, ((b_ - a_) / (2 * h) if a_ is not None and b_ is not None else 0.0)
+    after = [e for e in ex if e >= exp_ts]
+    before = [e for e in ex if e < exp_ts and e > now]
+    if not after:
+        return None, None
+    e2 = after[0]
+    iv2, s2 = var_and_slope(e2)
+    if iv2 is None:
+        return None, None
+    F = chain[e2]["F"]
+    if before:
+        e1 = before[-1]
+        iv1, s1 = var_and_slope(e1)
+        T1, T2 = (e1 - now) / (365.0 * 86400), (e2 - now) / (365.0 * 86400)
+        if iv1 is not None and T2 > T1:
+            w = (T - T1) / (T2 - T1)
+            var = iv1 * iv1 * T1 + w * (iv2 * iv2 * T2 - iv1 * iv1 * T1)
+            iv = math.sqrt(max(var, 1e-12) / T)
+            slope = s1 + w * (s2 - s1)
+            return _digital(F, K, T, iv, slope), iv
+    return _digital(F, K, T, iv2, s2), iv2
+
+
+def opt_worker():
+    last_disc = 0.0
+    while True:
+        try:
+            now = time.time()
+            if now - last_disc > 600 or not opt_mk:
+                opt_discover()
+                last_disc = now
+            chains = {}
+            for a in OPT_ASSETS:
+                try:
+                    chains[a] = _deribit(a)
+                    opt_state["deribit_ok"][a] = len(chains[a])
+                except Exception as e:
+                    opt_state["err"] = f"deribit {a}: {e}"
+                    chains[a] = {}
+            rows = []
+            with lock:
+                items = list(opt_mk.values())
+                bk = {t: books.get(t) for v in items for t in (v["yes"], v["no"])}
+            for v in items:
+                if v["expiry"] <= now:
+                    continue
+                p, iv = deribit_prob(chains.get(v["asset"]), v["strike"], v["expiry"], now)
+                by, bn = bk.get(v["yes"]), bk.get(v["no"])
+                ya, na = _best(by, "asks"), _best(bn, "asks")
+                rows.append((now, v["asset"], v["date"], v["expiry"], v["strike"], _best(by, "bids"), ya, _best(bn, "bids"),
+                             na, _depth(by, ya), _depth(bn, na), prices.get(v["asset"]),
+                             round(iv, 4) if iv else None, round(p * 100, 2) if p is not None else None,
+                             round((v["expiry"] - now) / 3600, 2), v["yes"]))
+            if rows:
+                db_exec("INSERT INTO lj_opt (ts,asset,date,expiry,strike,yes_bid,yes_ask,no_bid,no_ask,yes_ask_usd,no_ask_usd,"
+                        "spot,iv,deribit_p,hours_left,yes_tok) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows, many=True)
+                opt_state["rows"] += len(rows)
+            opt_state["last"] = now
+            for v in items:          # remember markets so outcomes can be filled in later
+                db_exec("INSERT OR IGNORE INTO lj_opt_mkts (yes_tok, asset, date, expiry, strike, slug, question) "
+                        "VALUES (?,?,?,?,?,?,?)", (v["yes"], v["asset"], v["date"], v["expiry"], v["strike"], v["slug"], v["question"]))
+        except Exception as e:
+            stats["errors"] += 1
+            opt_state["err"] = str(e)[:200]
+            log.error(f"opt: {e}")
+        time.sleep(OPT_SECS)
+
+
+def opt_settler():
+    while True:
+        try:
+            now = time.time()
+            for r in db_query("SELECT yes_tok, slug, strike FROM lj_opt_mkts WHERE outcome IS NULL AND expiry < ?", (now - 1800,)):
+                arr = requests.get(f"{GAMMA}/events", params={"slug": r["slug"]}, timeout=10).json()
+                ev = arr[0] if isinstance(arr, list) and arr else None
+                for m in (ev or {}).get("markets", []):
+                    try:
+                        toks = json.loads(m.get("clobTokenIds") or "[]")
+                    except Exception:
+                        toks = []
+                    if not toks or str(toks[0]) != r["yes_tok"]:
+                        continue
+                    op = m.get("outcomePrices")
+                    op = json.loads(op) if isinstance(op, str) else op
+                    if op and len(op) >= 2 and (float(op[0]) >= 0.99 or float(op[1]) >= 0.99):
+                        db_exec("UPDATE lj_opt_mkts SET outcome=? WHERE yes_tok=?",
+                                ("YES" if float(op[0]) >= 0.99 else "NO", r["yes_tok"]))
+        except Exception as e:
+            log.warning(f"opt settler: {e}")
+        time.sleep(900)
+
+
+def opt_text():
+    now = time.time()
+    L = ["📊 <b>OPTIONS GAP LOGGER</b> · Polymarket 'above $X' vs Deribit options (paper)",
+         f"dates found: " + (", ".join(f"{a} {d}" for a, d in opt_state["found"]) or "none yet") +
+         f" · strikes {opt_state['markets']} · deribit expiries " +
+         " · ".join(f"{a} {n}" for a, n in opt_state["deribit_ok"].items()) + f" · rows {opt_state['rows']}"]
+    if opt_state["err"]:
+        L.append(f"last error: {opt_state['err'][:150]}")
+    rows = db_query("SELECT * FROM lj_opt WHERE ts >= ? ORDER BY ts", (now - 3 * OPT_SECS,))
+    last = {}
+    for r in rows:
+        last[r["yes_tok"]] = r
+    gaps = []
+    for r in last.values():
+        p = r["deribit_p"]
+        if p is None:
+            continue
+        if r["yes_ask"] is not None and p - r["yes_ask"] >= OPT_GAP:
+            gaps.append((p - r["yes_ask"], f"{r['asset']} {r['date']} above ${r['strike']:,.0f}: buy YES {r['yes_ask']:g}¢ · options say {p:.0f}%"))
+        if r["no_ask"] is not None and (100 - p) - r["no_ask"] >= OPT_GAP:
+            gaps.append(((100 - p) - r["no_ask"], f"{r['asset']} {r['date']} above ${r['strike']:,.0f}: buy NO {r['no_ask']:g}¢ · options say NO {100 - p:.0f}%"))
+    gaps.sort(reverse=True)
+    L.append(f"<b>gaps ≥{OPT_GAP:g}¢ right now</b> ({len(gaps)}):")
+    L += [f"  +{g:.0f}¢ · {t}" for g, t in gaps[:15]] or ["  none"]
+    return "\n".join(L)
+
+
 # ── old data kept in the same database ──────────────────────────────────────
 OLD_TABLES = {"/export": ("trades", "lastmin_trades.csv.gz"), "/exporttrail": ("trail", "trail_trades.csv.gz"),
               "/exportsnaps": ("snaps", "lastmin_snaps.csv.gz")}
@@ -796,6 +1063,17 @@ def telegram_worker():
                         tg_document("lj_mkts.csv.gz", rows_csv_gz(m), f"{len(m)} markets with start price + outcome")
                     if not j and not m:
                         tg("no jumps logged yet")
+                elif t == "/opt":
+                    tg(opt_text())
+                elif t == "/optexport":
+                    o = db_query("SELECT * FROM lj_opt ORDER BY ts")
+                    om = db_query("SELECT * FROM lj_opt_mkts ORDER BY expiry, strike")
+                    if o:
+                        tg_document("lj_opt.csv.gz", rows_csv_gz(o), f"{len(o)} options-gap rows")
+                    if om:
+                        tg_document("lj_opt_mkts.csv.gz", rows_csv_gz(om), f"{len(om)} 'above $X' markets + outcomes")
+                    if not o and not om:
+                        tg("nothing logged yet - send /opt to see status")
                 elif t == "/dips":
                     tg(dips_text())
                 elif t == "/dipexport":
@@ -811,6 +1089,7 @@ def telegram_worker():
                        "/jumps — paper sniper per coin per market length (last 24h)\n"
                        "/jumpexport — raw jump snapshots + outcomes (gz CSV)\n"
                        "/dips — paper dip-buyer (sudden dumps while the coin is flat) · /dipexport — raw dip snapshots\n"
+                       "/opt — Polymarket 'above $X' vs Deribit options gaps · /optexport — raw rows\n"
                        "old data: /clexport (final-minute logger) · /oldstats · /export · /exporttrail · /exportsnaps")
         except Exception as e:
             log.warning(f"telegram: {e}")
@@ -819,7 +1098,7 @@ def telegram_worker():
 
 def main():
     init_db()
-    for fn in (resolver_worker, pm_worker, bn_worker, jl_worker, dip_worker, settler, telegram_worker):
+    for fn in (resolver_worker, pm_worker, bn_worker, jl_worker, dip_worker, opt_worker, opt_settler, settler, telegram_worker):
         threading.Thread(target=fn, daemon=True).start()
     log.info(f"long-market jump logger ON: {ASSETS} {TFS} ≥{JL_BPS}bp in {JL_WINDOW}s")
     tg(f"⚡ long-market jump logger + 📉 dip logger started ({','.join(ASSETS)} · jumps {'/'.join(label(t) for t in TFS)}"
