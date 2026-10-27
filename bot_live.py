@@ -790,15 +790,16 @@ def opt_discover():
             exp = int(datetime(d.year, d.month, d.day, 12, 0, tzinfo=ET).timestamp())
             if exp < time.time() + 60:
                 continue
-            for sl in (f"{name}-above-on-{mon}-{d.day}", f"{name}-above-on-{mon}-{d.day}-{d.year}"):
+            for sl in (f"{name}-above-on-{mon}-{d.day}-{d.year}", f"{name}-above-on-{mon}-{d.day}"):
                 try:
                     arr = requests.get(f"{GAMMA}/events", params={"slug": sl}, timeout=10).json()
                 except Exception as e:
                     opt_state["err"] = f"gamma: {e}"
                     continue
                 ev = arr[0] if isinstance(arr, list) and arr else (arr if isinstance(arr, dict) else None)
-                if not ev or not ev.get("markets"):
-                    continue
+                if not ev or not ev.get("markets") or ev.get("closed"):
+                    continue                       # missing, or last year's event with the same name
+                n0 = len(found)
                 for m in ev["markets"]:
                     if m.get("closed"):
                         continue
@@ -817,7 +818,8 @@ def opt_discover():
                     if k_ and len(toks) == 2:
                         found[str(toks[0])] = dict(asset=a, date=d.isoformat(), strike=k_, expiry=ex, yes=str(toks[0]),
                                                    no=str(toks[1]), slug=sl, question=(m.get("question") or "")[:120])
-                break
+                if len(found) > n0:
+                    break
     with lock:
         opt_mk.clear()
         opt_mk.update(found)
