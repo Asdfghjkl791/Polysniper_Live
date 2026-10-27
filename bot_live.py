@@ -787,7 +787,7 @@ def opt_discover():
         for k in range(OPT_DAYS + 1):
             d = today + timedelta(days=k)
             mon = MONTHS[d.month - 1]
-            exp = int(datetime(d.year, d.month, d.day, 12, 0, tzinfo=ET).timestamp())
+            exp = int(datetime(d.year, d.month, d.day, 12, 0, tzinfo=ET).timestamp()) + 60   # close of the 12:00 1m candle
             if exp < time.time() + 60:
                 continue
             for sl in (f"{name}-above-on-{mon}-{d.day}-{d.year}", f"{name}-above-on-{mon}-{d.day}"):
@@ -811,7 +811,7 @@ def opt_discover():
                     ex = exp
                     try:                               # use the market's own end time when it's near noon ET
                         e2 = datetime.fromisoformat(str(m.get("endDate", "")).replace("Z", "+00:00")).timestamp()
-                        if abs(e2 - exp) <= 6 * 3600:
+                        if abs(e2 - exp) <= 6 * 3600 and e2 > exp:     # never earlier than the candle close
                             ex = int(e2)
                     except Exception:
                         pass
@@ -844,7 +844,8 @@ def _deribit(a):
         F = float(x.get("underlying_price") or 0)
         if F <= 0 or (p[3] == "C" and K < F) or (p[3] == "P" and K > F):
             continue
-        o = out.setdefault(int(e.timestamp()), {"F": F, "smile": []})
+        idx = float(x.get("estimated_delivery_price") or 0)
+        o = out.setdefault(int(e.timestamp()), {"F": F, "basis": (F / idx) if idx > 0 else 1.0, "smile": []})
         o["smile"].append((K, float(x["mark_iv"]) / 100.0))
     for o in out.values():
         o["smile"].sort()
@@ -874,8 +875,9 @@ def _digital(F, K, T, iv, div):
     return min(1.0, max(0.0, p))
 
 
-def deribit_prob(chain, K, exp_ts, now):
-    """P(above K at exp_ts) - total variance interpolated between the two Deribit expiries around exp_ts"""
+def deribit_prob(chain, K, exp_ts, now, spot=None):
+    """P(above K at exp_ts) - total variance interpolated between the two Deribit expiries around exp_ts.
+    The forward is Binance's price (what Polymarket settles on) times Deribit's futures premium for that date."""
     if not chain:
         return None, None
     ex = sorted(chain)
@@ -897,7 +899,8 @@ def deribit_prob(chain, K, exp_ts, now):
     iv2, s2 = var_and_slope(e2)
     if iv2 is None:
         return None, None
-    F = chain[e2]["F"]
+    T2_ = max((e2 - now) / (365.0 * 86400), 1e-9)
+    F = spot * chain[e2].get("basis", 1.0) ** min(1.0, T / T2_) if spot else chain[e2]["F"]   # premium scaled to our date
     if before:
         e1 = before[-1]
         iv1, s1 = var_and_slope(e1)
@@ -934,7 +937,7 @@ def opt_worker():
             for v in items:
                 if v["expiry"] <= now:
                     continue
-                p, iv = deribit_prob(chains.get(v["asset"]), v["strike"], v["expiry"], now)
+                p, iv = deribit_prob(chains.get(v["asset"]), v["strike"], v["expiry"], now, prices.get(v["asset"]))
                 by, bn = bk.get(v["yes"]), bk.get(v["no"])
                 ya, na = _best(by, "asks"), _best(bn, "asks")
                 rows.append((now, v["asset"], v["date"], v["expiry"], v["strike"], _best(by, "bids"), ya, _best(bn, "bids"),
