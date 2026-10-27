@@ -26,7 +26,7 @@
 # ENV (optional): ASSETS=BTC,ETH,SOL  TFS=60,240,1440  JL_BPS=5  JL_WINDOW=2  JL_COOLDOWN=10
 #   JL_STAKE=50  DB_PATH=final_minute.db  KEEP_DAYS=30
 
-import os, time, json, sqlite3, logging, threading, requests, csv, io, gzip, math
+import os, re, time, json, sqlite3, logging, threading, requests, csv, io, gzip, math
 from collections import deque
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -140,8 +140,13 @@ def db_query(sql, args=()):
 # ── telegram ────────────────────────────────────────────────────────────────
 def tg(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000], "parse_mode": "HTML"}, timeout=8)
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000], "parse_mode": "HTML"}, timeout=8)
+        if r.status_code != 200:                 # bad formatting -> send as plain text instead
+            log.error(f"tg {r.status_code}: {r.text[:150]}")
+            plain = re.sub(r"</?b>", "", msg).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": plain[:4000]}, timeout=8)
     except Exception as e:
         log.error(f"tg: {e}")
 
@@ -616,7 +621,7 @@ def dip_worker():
 def dips_text():
     now = time.time()
     L = [f"📉 <b>DIP LOGGER</b> · {','.join(ASSETS)} {'/'.join(label(t) for t in DIP_TFS)} · bid drops "
-         f"≥{DIP_CENTS:g}¢ in {DIP_WINDOW:g}s while the coin moves <{DIP_FLAT_BPS:g}bp",
+         f"≥{DIP_CENTS:g}¢ in {DIP_WINDOW:g}s while the coin moves &lt;{DIP_FLAT_BPS:g}bp",
          f"dips since restart: {stats['dips']}"]
     rows = db_query("SELECT * FROM lj_dips WHERE t0 >= ? ORDER BY did, off", (now - 86400,))
     if not rows:
@@ -627,7 +632,7 @@ def dips_text():
         ev.setdefault(r["did"], {})[r["off"]] = r
     vers = [("every dip", lambda e, s: True), ("edge 10+", lambda e, s: e is not None and e >= 10),
             ("real dump ($50+ sold)", lambda e, s: s >= 50),
-            ("edge 10+ & $50+ sold", lambda e, s: e is not None and e >= 10 and s >= 50)]
+            ("edge 10+ &amp; $50+ sold", lambda e, s: e is not None and e >= 10 and s >= 50)]
     tot = {}
     for did, s in ev.items():
         z, a_s = s.get(0.0), s.get(0.25)
@@ -668,8 +673,8 @@ def dips_text():
 
 # ── /jumps ──────────────────────────────────────────────────────────────────
 VERS = [("every jump", lambda x, e, g: True),
-        ("calm 5+ min + <85c", lambda x, e, g: g > 300 and x < 85),
-        ("edge 10+ + <85c", lambda x, e, g: e is not None and e >= 10 and x < 85),
+        ("calm 5+ min + &lt;85c", lambda x, e, g: g > 300 and x < 85),
+        ("edge 10+ + &lt;85c", lambda x, e, g: e is not None and e >= 10 and x < 85),
         ("edge 20+", lambda x, e, g: e is not None and e >= 20)]
 
 
