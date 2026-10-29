@@ -119,6 +119,11 @@ def init_db():
             yes_bid REAL, yes_ask REAL, no_bid REAL, no_ask REAL, yes_ask_usd REAL, no_ask_usd REAL, spot REAL,
             iv REAL, deribit_p REAL, hours_left REAL, yes_tok TEXT)""")
         c.execute("CREATE INDEX IF NOT EXISTS lo_ts ON lj_opt(ts)")
+        for col in ("yes_bid_usd", "no_bid_usd", "yes_bid_usd5", "no_bid_usd5"):   # Oct 29: $ waiting at the sell price
+            try:
+                c.execute(f"ALTER TABLE lj_opt ADD COLUMN {col} REAL")
+            except sqlite3.OperationalError:
+                pass
         c.execute("""CREATE TABLE IF NOT EXISTS lj_opt_mkts (yes_tok TEXT PRIMARY KEY, asset TEXT, date TEXT,
             expiry INTEGER, strike REAL, slug TEXT, question TEXT, outcome TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS lj_mkts (asset TEXT, tf INTEGER, open_ts INTEGER, outcome TEXT,
@@ -468,6 +473,13 @@ def _depth(b, best, cents=2.0):
     if not b or best is None:
         return None
     return round(sum(px * sz / 100.0 for px, sz in b["asks"].items() if px <= best + cents + 1e-9), 2)
+
+
+def _bdepth(b, best, cents=2.0):
+    """$ of bids within `cents` of the best bid (what a seller could get filled quickly)"""
+    if not b or best is None:
+        return None
+    return round(sum(px * sz / 100.0 for px, sz in b["bids"].items() if px >= best - cents - 1e-9), 2)
 
 
 def _ladder(bu, bd, n=6):
@@ -940,13 +952,16 @@ def opt_worker():
                 p, iv = deribit_prob(chains.get(v["asset"]), v["strike"], v["expiry"], now, prices.get(v["asset"]))
                 by, bn = bk.get(v["yes"]), bk.get(v["no"])
                 ya, na = _best(by, "asks"), _best(bn, "asks")
-                rows.append((now, v["asset"], v["date"], v["expiry"], v["strike"], _best(by, "bids"), ya, _best(bn, "bids"),
+                yb, nb = _best(by, "bids"), _best(bn, "bids")
+                rows.append((now, v["asset"], v["date"], v["expiry"], v["strike"], yb, ya, nb,
                              na, _depth(by, ya), _depth(bn, na), prices.get(v["asset"]),
                              round(iv, 4) if iv else None, round(p * 100, 2) if p is not None else None,
-                             round((v["expiry"] - now) / 3600, 2), v["yes"]))
+                             round((v["expiry"] - now) / 3600, 2), v["yes"],
+                             _bdepth(by, yb), _bdepth(bn, nb), _bdepth(by, yb, 5.0), _bdepth(bn, nb, 5.0)))
             if rows:
                 db_exec("INSERT INTO lj_opt (ts,asset,date,expiry,strike,yes_bid,yes_ask,no_bid,no_ask,yes_ask_usd,no_ask_usd,"
-                        "spot,iv,deribit_p,hours_left,yes_tok) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows, many=True)
+                        "spot,iv,deribit_p,hours_left,yes_tok,yes_bid_usd,no_bid_usd,yes_bid_usd5,no_bid_usd5) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows, many=True)
                 opt_state["rows"] += len(rows)
             opt_state["last"] = now
             for v in items:          # remember markets so outcomes can be filled in later
