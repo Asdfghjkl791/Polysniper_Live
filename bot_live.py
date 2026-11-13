@@ -32,6 +32,8 @@ import websocket
 import types
 E2_ON = False
 early2 = None                                  # second early logger, built in main()
+ALT_ON = False
+alts = None                                    # SOL/XRP/ETH long-shot recorder, built in main()
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -2066,6 +2068,14 @@ def telegram_worker():
                     except Exception as e:
                         tg(f"⚠️ early2: {str(e)[:200]}")
                         continue
+                if ALT_ON:                                  # alts recorder (paper only)
+                    try:
+                        parts = (msg.get("text") or "").strip().split()
+                        if alts.handle(t, parts[1].lower() if len(parts) > 1 else "", tg):
+                            continue
+                    except Exception as e:
+                        tg(f"⚠️ alts: {str(e)[:200]}")
+                        continue
                 if t == "/dstatus":
                     tg(d_status())
                     continue
@@ -2183,7 +2193,7 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/deribitexport — Deribit skew/same-day vol/perp/trades log (1/min)\n/extraexport — extra recorder: window books, PM trades, market info, Binance stats, new rows (add 'all' for everything)\n/extrastatus — extra + lead recorder health\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/altstatus — SOL/XRP/ETH long-shot recorder health + Polymarket book delay\n/altexport — SOL/XRP/ETH jump rows + results, new rows (add 'all' for everything)\n/deribitexport — Deribit skew/same-day vol/perp/trades log (1/min)\n/extraexport — extra recorder: window books, PM trades, market info, Binance stats, new rows (add 'all' for everything)\n/extrastatus — extra + lead recorder health\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
@@ -2616,6 +2626,532 @@ def _make_early2():
     return types.SimpleNamespace(**dict(locals()))   # start, handle, st, ... (everything defined above)
 
 
+# ── alts: SOL / XRP / ETH long-shot recorder (paper research only, NEVER trades) ─────────────────────
+# Added Nov 13 2026. Two questions:
+#   1. own-jump long shots on SOL and XRP: SOL (or XRP) moves >= 2/3/5bp within 2s on Binance -> that coin's 5m + 15m books
+#   2. follow-BTC long shots: BTC moves >= 2/3/5bp -> the ETH, SOL and XRP 5m + 15m books, before they catch up
+# For every trigger it saves both sides of each market (top 4 asks + bids) at 0 / 0.25 / 0.5 / 1 / 2s, every coin's
+# Binance price at the same moments, and two fair prices for UP (Binance-open rule and the Chainlink 60s-TWAP rule, our vol).
+# It also measures how late the Polymarket books are (Polymarket's own message time vs when we got it) -> /altstatus.
+# Telegram:  /altstatus   /altexport [all]
+# Env (all optional): ALT_LOG (true) · ALT_MKTS ("ETH,SOL,XRP") · ALT_OWN ("SOL,XRP") · ALT_LEAD ("BTC") · ALT_KEEP_DAYS (10)
+def _make_alts(get_creds):
+    import os, time, json, math, threading, logging, requests, csv, io, gzip, zlib, statistics
+    from collections import deque
+    import websocket
+
+    log = logging.getLogger("alts")
+    SYMS = {"BTC": "btcusdt", "ETH": "ethusdt", "SOL": "solusdt", "XRP": "xrpusdt"}
+
+    def _coins(k, d):
+        return [c.strip().upper() for c in os.environ.get(k, d).split(",") if c.strip().upper() in SYMS]
+
+    MKT = _coins("ALT_MKTS", "ETH,SOL,XRP")          # coins whose Polymarket books we keep
+    OWN = [c for c in _coins("ALT_OWN", "SOL,XRP") if c in MKT]   # own jumps -> that coin's markets
+    LEAD = _coins("ALT_LEAD", "BTC")                  # leader jumps -> every coin in MKT
+    COINS = sorted(set(MKT) | set(OWN) | set(LEAD))
+    KEEP_DAYS = float(os.environ.get("ALT_KEEP_DAYS", "10"))
+    TFS = (5, 15)
+    LEVELS = (2.0, 3.0, 5.0)
+    WIN, COOL = 2.0, 10.0
+    SNAPS = (0.25, 0.5, 1.0, 2.0)
+    DEPTH = 4
+    EXPORT_LAG = 20.0
+    EXPORT_ROWS = 12000                               # rows per Telegram file (keeps each file well under 50MB)
+    _streams = "/".join(f"{SYMS[c]}@bookTicker" for c in COINS)
+    FEEDS = {"vis": f"wss://data-stream.binance.vision/stream?streams={_streams}",
+             "spot": f"wss://stream.binance.com:9443/stream?streams={_streams}"}
+    BY_SYM = {SYMS[c].upper(): c for c in COINS}
+    GAMMA = "https://gamma-api.polymarket.com"
+    PM_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    CL_WS = "wss://ws-live-v2.polymarket.com/ws"
+    KLINES = "https://data-api.binance.vision/api/v3/klines"
+
+    lock = threading.RLock()
+    books, book_rt = {}, {}                  # tok -> {"b": {px: sz}, "a": {px: sz}}; tok -> last update (our clock)
+    markets, opens = {}, {}                  # (coin, tf, o) -> (up, dn); (coin, tf, o) -> Binance open
+    q2 = {(c, f): deque(maxlen=3000) for c in COINS for f in FEEDS}
+    last_px = {(c, f): None for c in COINS for f in FEEDS}
+    last_t = {(c, f): 0.0 for c in COINS for f in FEEDS}
+    px1s = {c: deque(maxlen=1200) for c in COINS}
+    cl = {c: deque(maxlen=4000) for c in MKT}       # (chainlink ts, our ts, value)
+    tw_opens = {}                                    # (coin, tf, o) -> exact TWAP at the start second
+    last_trig = {}
+    tlock = threading.Lock()
+    lags = deque(maxlen=3000)                        # our receive time - Polymarket's message time (s)
+    gen = {"n": 0, "retired": set()}
+    st = {"ticks": {f: 0 for f in FEEDS}, "pm": 0, "drops": 0, "trig": 0, "saved": 0, "cl": {c: 0 for c in MKT},
+          "tw": {c: 0 for c in MKT}, "err": "", "started": time.time()}
+    H = {}
+
+    def _err(where, e):
+        st["err"] = f"{time.strftime('%H:%M:%S')} {where}: {str(e)[:120]}"
+
+    def ncdf(z):
+        return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+    def window(tf, now):
+        L = tf * 60
+        o = int(now // L) * L
+        return o, o + L
+
+    def gamma_market(c, tf, o):
+        arr = requests.get(f"{GAMMA}/events", params={"slug": f"{c.lower()}-updown-{tf}m-{o}"}, timeout=10).json()
+        mk = (arr[0] if isinstance(arr, list) and arr else {}).get("markets", [])
+        return mk[0] if mk else None
+
+    # ── fair prices ──────────────────────────────────────────────────────────────
+    def sigma(c):
+        pts = [p for p in list(px1s[c]) if p[0] >= time.time() - 900]
+        r = [(math.log(y / x)) ** 2 / (t1 - t0) for (t0, x), (t1, y) in zip(pts, pts[1:]) if t1 > t0 and x > 0 and y > 0]
+        return max(2e-5, math.sqrt(sum(r) / len(r))) if len(r) >= 30 else None
+
+    def fair_bn(c, tf, o, now, px, s):
+        op, left = opens.get((c, tf, o)), o + tf * 60 - now
+        if not (s and op and px and left > 0):
+            return None
+        return 100.0 * ncdf(math.log(px / op) / (s * math.sqrt(left)))
+
+    def tw_strike(c, tf, o):
+        if (c, tf, o) in tw_opens:
+            return tw_opens[(c, tf, o)], "feed"
+        pts = [v for ts, rt, v in list(cl[c]) if o - 62 <= ts <= o - 3]
+        return (sum(pts) / len(pts), "cl") if len(pts) >= 20 else (None, None)
+
+    def fair_tw(c, tf, o, now, s):
+        """UP chance under the real rule: average Chainlink over [end-62, end-3] >= TWAP strike (Chainlink brought to now with Binance)"""
+        k, _ = tw_strike(c, tf, o)
+        Hc = list(cl[c])
+        if not (k and s and Hc and px1s[c]):
+            return None, None
+        e = o + tf * 60
+        a, b = e - 62, e - 3
+        ts_l, rt_l, x = Hc[-1]
+        bn = [p for t, p in list(px1s[c]) if t <= rt_l]
+        x_now = x * px_now(c) / bn[-1] if (bn and px_now(c)) else x
+        if now >= b:
+            pts = [v for ts, rt, v in Hc if a <= ts <= b]
+            return (None if not pts else (100.0 if sum(pts) / len(pts) >= k else 0.0)), x_now
+        known = [v for ts, rt, v in Hc if a <= ts <= now] if now > a else []
+        f = min(1.0, (now - a) / (b - a)) if (now > a and known) else 0.0
+        start = max(now, a)
+        d, L = start - now, b - start
+        mean = (sum(known) / len(known) if known else x_now) * f + x_now * (1 - f)
+        sd = (1 - f) * s * math.sqrt(max(1e-9, d + L / 3.0))
+        return 100.0 * ncdf(math.log(mean / k) / sd), x_now
+
+    # ── Chainlink price + TWAP (Polymarket's live feed, needs the account's API key -> read only) ─────────
+    def _points(m):
+        out = []
+
+        def walk(x):
+            if isinstance(x, dict):
+                v, ts = x.get("value"), x.get("timestamp") or x.get("ts")
+                if v is not None and ts is not None:
+                    try:
+                        tsf = float(ts)
+                        out.append((tsf / 1000 if tsf > 1e11 else tsf, float(v)))
+                        return
+                    except (TypeError, ValueError):
+                        pass
+                for k in ("payload", "data", "snapshot"):
+                    if k in x:
+                        walk(x[k])
+            elif isinstance(x, list):
+                for y in x:
+                    walk(y)
+        walk(m)
+        return out
+
+    def cl_worker(c, twap):
+        sym = c.lower() + "usd"
+        while True:
+            try:
+                cr = get_creds()
+                ws = websocket.create_connection(CL_WS, timeout=10)
+                ws.settimeout(30)
+                ws.send(json.dumps({"op": "auth", "rid": "a", "auth": {"apiKey": cr.api_key, "secret": cr.api_secret,
+                                                                       "passphrase": cr.api_passphrase}}))
+                sub = {"channel": "price.crypto.twap", "filter": {"symbol": sym, "window_seconds": 60}} if twap else \
+                      {"channel": "price.crypto", "filter": {"symbol": sym}}
+                ws.send(json.dumps({"op": "subscribe", "rid": "s", "subscriptions": [sub]}))
+                lp = time.time()
+                while True:
+                    if time.time() - lp > 15:
+                        ws.ping()
+                        lp = time.time()
+                    raw = ws.recv()
+                    now = time.time()
+                    try:
+                        m = json.loads(raw)
+                    except Exception:
+                        continue
+                    if isinstance(m, dict) and m.get("op") == "error":
+                        _err(f"chainlink {sym}{' twap' if twap else ''}", m)
+                        continue
+                    if twap and isinstance(m, dict) and m.get("channel") and "twap" not in str(m.get("channel")):
+                        continue
+                    for ts, v in sorted(_points(m)):
+                        if twap:
+                            st["tw"][c] += 1
+                            for tf in TFS:
+                                o = window(tf, ts)[0]
+                                if (c, tf, o) not in tw_opens and abs(ts - o) < 0.5:
+                                    tw_opens[(c, tf, o)] = v
+                        else:
+                            if cl[c] and ts <= cl[c][-1][0]:
+                                continue
+                            cl[c].append((ts, now, v))
+                            st["cl"][c] += 1
+            except Exception as e:
+                _err(f"chainlink {sym}{' twap' if twap else ''}", e)
+            time.sleep(10)
+
+    # ── markets / Polymarket books (two connections, instant reconnect) ─────────────────────────────
+    def kline_open(c, o):
+        try:
+            j = requests.get(KLINES, params=dict(symbol=SYMS[c].upper(), interval="1m", startTime=o * 1000,
+                                                 endTime=o * 1000 + 59000, limit=1), timeout=8).json()
+            return float(j[0][1]) if isinstance(j, list) and j else None
+        except Exception:
+            return None
+
+    def market_worker():
+        while True:
+            try:
+                now = time.time()
+                for c in MKT:
+                    for tf in TFS:
+                        cur = window(tf, now)[0]
+                        if now >= cur + 60 and (c, tf, cur) not in opens:
+                            op = kline_open(c, cur)
+                            if op:
+                                opens[(c, tf, cur)] = op
+                        for o in (cur, window(tf, now + 90)[0]):
+                            if (c, tf, o) in markets:
+                                continue
+                            try:
+                                m = gamma_market(c, tf, o)
+                                t = json.loads(m.get("clobTokenIds", "[]")) if m else []
+                            except Exception:
+                                t = []
+                            if len(t) == 2:
+                                with lock:
+                                    markets[(c, tf, o)] = (str(t[0]), str(t[1]))
+                                H["db_exec"]("INSERT OR IGNORE INTO alt_mkts (coin, tf, open_ts) VALUES (?,?,?)", (c, tf, o))
+                        k = (c, tf, cur)
+                        if k in opens or k in tw_opens:
+                            ks = tw_strike(c, tf, cur)
+                            H["db_exec"]("UPDATE alt_mkts SET bn_open=COALESCE(bn_open, ?), tw_strike=COALESCE(tw_strike, ?), "
+                                         "tw_src=COALESCE(tw_src, ?) WHERE coin=? AND tf=? AND open_ts=?",
+                                         (opens.get(k), ks[0], ks[1], c, tf, cur))
+                with lock:
+                    for k in [k for k in markets if k[2] + k[1] * 60 < now - 300]:
+                        markets.pop(k, None)
+                for d in (opens, tw_opens):
+                    for k in [k for k in d if k[2] + k[1] * 60 < now - 3600]:
+                        d.pop(k, None)
+            except Exception as e:
+                _err("markets", e)
+            time.sleep(3)
+
+    def pm_handle(raw, rt):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        for m in (data if isinstance(data, list) else [data]):
+            if not isinstance(m, dict):
+                continue
+            st["pm"] += 1
+            et = m.get("event_type")
+            try:
+                ts = float(m.get("timestamp") or 0)
+                if ts > 1e11:
+                    lags.append(rt - ts / 1000)
+            except (TypeError, ValueError):
+                pass
+            with lock:
+                if et == "book":
+                    tok = str(m.get("asset_id"))
+                    books[tok] = {"b": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("bids") or m.get("buys") or [])},
+                                  "a": {round(float(x["price"]) * 100, 3): float(x["size"]) for x in (m.get("asks") or m.get("sells") or [])}}
+                    book_rt[tok] = rt
+                elif et == "price_change":
+                    for ch in (m.get("price_changes") or m.get("changes") or []):
+                        tok = str(ch.get("asset_id") or m.get("asset_id"))
+                        b = books.setdefault(tok, {"b": {}, "a": {}})
+                        lvl = b["b"] if str(ch.get("side", "")).upper() == "BUY" else b["a"]
+                        p, sz = round(float(ch["price"]) * 100, 3), float(ch.get("size", 0))
+                        if sz <= 0:
+                            lvl.pop(p, None)
+                        else:
+                            lvl[p] = sz
+                        book_rt[tok] = rt
+
+    def pm_conn(toks, g):
+        fails = 0
+        while g not in gen["retired"]:
+            try:
+                ws = websocket.create_connection(PM_WS, timeout=10)
+                ws.settimeout(15)
+                ws.send(json.dumps({"assets_ids": list(toks), "type": "market"}))
+                lp, fails = time.time(), 0
+                while g not in gen["retired"]:
+                    if time.time() - lp > 10:
+                        ws.send("PING")
+                        lp = time.time()
+                    raw = ws.recv()
+                    if raw and raw[0] in "{[":
+                        pm_handle(raw, time.time())
+                ws.close()
+            except Exception as e:
+                if g in gen["retired"]:
+                    return
+                fails += 1
+                st["drops"] += 1
+                if fails >= 3:
+                    _err("pm", e)
+                time.sleep(0.05 if fails < 3 else 2)
+
+    def pm_worker():
+        cur = None
+        while True:
+            try:
+                with lock:
+                    toks = tuple(sorted(t for v in markets.values() for t in v))
+                if toks and toks != cur:
+                    old = gen["n"]
+                    gen["n"] += 1
+                    for _ in (0, 1):
+                        threading.Thread(target=pm_conn, args=(toks, gen["n"]), daemon=True).start()
+                    if cur is not None:
+                        time.sleep(3)
+                        gen["retired"].add(old)
+                    cur = toks
+                    with lock:
+                        keep = set(cur)
+                        for t in [t for t in books if t not in keep]:
+                            books.pop(t, None)
+                            book_rt.pop(t, None)
+            except Exception as e:
+                _err("pm_worker", e)
+            time.sleep(1)
+
+    def top(tok):
+        with lock:
+            b = books.get(tok) or {}
+            a = sorted((p, s) for p, s in (b.get("a") or {}).items() if p < 100)[:DEPTH]
+            bi = sorted(((p, s) for p, s in (b.get("b") or {}).items() if p > 0), reverse=True)[:DEPTH]
+        return [[p, round(s, 1)] for p, s in a], [[p, round(s, 1)] for p, s in bi]
+
+    # ── triggers + capture ───────────────────────────────────────────────────────
+    def tick(c, feed, now, px):
+        q = q2[(c, feed)]
+        q.append((now, px))
+        last_px[(c, feed)] = px
+        last_t[(c, feed)] = now
+        while q and q[0][0] < now - WIN:
+            q.popleft()
+        if feed == "vis":
+            p1 = px1s[c]
+            if not p1 or now - p1[-1][0] >= 1.0:
+                p1.append((now, px))
+            for tf in TFS:
+                o = window(tf, now)[0]
+                if (c, tf, o) not in opens and now - o <= 5:
+                    opens[(c, tf, o)] = px
+        if c not in OWN and c not in LEAD:
+            return
+        bps = (px / q[0][1] - 1) * 1e4
+        sg = 1 if bps > 0 else -1
+        for lvl in LEVELS:
+            if abs(bps) < lvl:
+                break
+            k = (c, lvl, sg)
+            with tlock:
+                if now - last_trig.get(k, 0) < COOL:
+                    continue
+                last_trig[k] = now
+            st["trig"] += 1
+            threading.Thread(target=capture, args=(now, c, feed, lvl, bps), daemon=True).start()
+
+    def px_now(c):
+        f = max(FEEDS, key=lambda f: last_t[(c, f)])
+        return last_px[(c, f)] or last_px[(c, "vis")]
+
+    def prices():
+        return {c: px_now(c) for c in COINS}
+
+    def capture(t0, c, feed, lvl, bps):
+        try:
+            targets = set(MKT) if c in LEAD else {c}
+            if c in OWN and c in LEAD:
+                targets = set(MKT)
+            with lock:
+                live = sorted((k, v) for k, v in markets.items() if k[0] in targets and k[2] <= t0 < k[2] + k[1] * 60)
+            if not live:
+                return
+            lag_now = statistics.median(list(lags)[-200:]) if len(lags) >= 20 else None
+            rec = {"t0": round(t0, 3), "coin": c, "feed": feed, "lvl": lvl, "bps": round(bps, 2), "px": {"0": prices()},
+                   "lag": None if lag_now is None else round(lag_now, 3), "mk": {}}
+            sig = {}
+            for (mc, tf, o), (u, d) in live:
+                if mc not in sig:
+                    sig[mc] = sigma(mc)
+                s = sig[mc]
+                px = px_now(mc)
+                fb = fair_bn(mc, tf, o, t0, px, s)
+                ft, cl_now = fair_tw(mc, tf, o, t0, s)
+                k, ksrc = tw_strike(mc, tf, o)
+                ua, ub = top(u)
+                da, db = top(d)
+                rec["mk"][f"{mc}{tf}"] = {"o": o, "left": round(o + tf * 60 - t0, 1), "bn_open": opens.get((mc, tf, o)),
+                                          "k": k, "ksrc": ksrc, "cl": cl_now, "sig": s,
+                                          "fb": None if fb is None else round(fb, 2), "ft": None if ft is None else round(ft, 2),
+                                          "age": round(t0 - min(book_rt.get(u, 0), book_rt.get(d, 0)), 2),
+                                          "s": {"0": [ua, ub, da, db]}}
+            for off in SNAPS:
+                time.sleep(max(0.0, t0 + off - time.time()))
+                for (mc, tf, o), (u, d) in live:
+                    ua, ub = top(u)
+                    da, db = top(d)
+                    rec["mk"][f"{mc}{tf}"]["s"][f"{off:g}"] = [ua, ub, da, db]
+                rec["px"][f"{off:g}"] = prices()
+            H["db_exec"]("INSERT INTO alt_rec (t0, coin, lvl, sg, data) VALUES (?,?,?,?,?)",
+                         (t0, c, lvl, 1 if bps > 0 else -1, zlib.compress(json.dumps(rec, separators=(",", ":")).encode())))
+            st["saved"] += 1
+        except Exception as e:
+            _err("capture", e)
+
+    def feed_worker(name):
+        while True:
+            try:
+                ws = websocket.create_connection(FEEDS[name], timeout=10)
+                ws.settimeout(30)
+                while True:
+                    d = json.loads(ws.recv()).get("data", {})
+                    c = BY_SYM.get(str(d.get("s", "")).upper())
+                    b, k = float(d.get("b", 0)), float(d.get("a", 0))
+                    if c and b > 0 and k > 0:
+                        st["ticks"][name] += 1
+                        tick(c, name, time.time(), (b + k) / 2)
+            except Exception as e:
+                _err(f"feed {name}", e)
+            time.sleep(3)
+
+    # ── results + cleanup ────────────────────────────────────────────────────────
+    def outcome_worker():
+        last_prune = 0
+        while True:
+            try:
+                rows = H["db_query"]("SELECT coin, tf, open_ts FROM alt_mkts WHERE outcome IS NULL AND open_ts + tf*60 < ? "
+                                     "AND open_ts + tf*60 > ? LIMIT 60", (time.time() - 150, time.time() - 3 * 86400))
+                for r in rows:
+                    try:
+                        m = gamma_market(r["coin"], r["tf"], r["open_ts"])
+                        op = m.get("outcomePrices") if m else None
+                        op = json.loads(op) if isinstance(op, str) else op
+                        out = "UP" if op and float(op[0]) >= 0.99 else "DOWN" if op and float(op[1]) >= 0.99 else None
+                        if out:
+                            H["db_exec"]("UPDATE alt_mkts SET outcome=? WHERE coin=? AND tf=? AND open_ts=?",
+                                         (out, r["coin"], r["tf"], r["open_ts"]))
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                if time.time() - last_prune > 6 * 3600:
+                    H["db_exec"]("DELETE FROM alt_rec WHERE t0 < ?", (time.time() - KEEP_DAYS * 86400,))
+                    last_prune = time.time()
+            except Exception as e:
+                _err("outcomes", e)
+            time.sleep(60)
+
+    # ── telegram ─────────────────────────────────────────────────────────────────
+    def _send(name, rows, header, caption):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(header)
+        w.writerows([list(x) for x in rows])
+        r = requests.post(f"https://api.telegram.org/bot{H['token']}/sendDocument",
+                          data={"chat_id": H["chat"], "caption": caption[:1000]},
+                          files={"document": (name, gzip.compress(buf.getvalue().encode()), "application/gzip")}, timeout=300)
+        return r.status_code == 200
+
+    def status_text():
+        L = sorted(list(lags)[-1000:])
+
+        def q(p):
+            return L[min(len(L) - 1, int(p * len(L)))]
+        n = H["db_query"]("SELECT coin, lvl, COUNT(*) n FROM alt_rec GROUP BY coin, lvl ORDER BY coin, lvl")
+        with lock:
+            nm = len(markets)
+            age = [time.time() - book_rt[t] for v in markets.values() for t in v if t in book_rt]
+        lines = ["🛰 <b>alts recorder</b> (paper only, never trades)",
+                 f"markets: {', '.join(MKT)} 5m+15m ({nm} open) · own jumps: {', '.join(OWN) or '-'} · follow: {', '.join(LEAD) or '-'}"]
+        if L:
+            ok = "✅ real-time" if q(0.5) < 0.5 and q(0.9) < 1.5 else "⚠️ books running late"
+            lines.append(f"Polymarket book delay: median {q(0.5):.2f}s · 90% {q(0.9):.2f}s · 99% {q(0.99):.2f}s {ok}")
+        else:
+            lines.append("Polymarket book delay: no data yet")
+        lines.append((f"oldest book update {max(age):.0f}s ago" if age else "no books yet") + f" · ws drops {st['drops']} · msgs {st['pm']}")
+        lines.append("saved: " + (", ".join(f"{r['coin']} {r['lvl']:g}bp {r['n']}" for r in n) or "none yet"))
+        lines.append(f"since start: triggers {st['trig']}, saved {st['saved']} · Binance ticks {st['ticks']}")
+        lines.append(f"Chainlink ticks {st['cl']} · TWAP ticks {st['tw']}")
+        if st["err"]:
+            lines.append(f"last error: {st['err']}")
+        return "\n".join(lines)
+
+    def handle(cmd, arg, tg):
+        if cmd == "/altstatus":
+            tg(status_text())
+            return True
+        if cmd == "/altexport":
+            key = "last_export_alts"
+            since = 0.0
+            if arg != "all":
+                r = H["db_query"]("SELECT v FROM e2_kv WHERE k=?", (key,))
+                since = float(r[0]["v"]) if r else 0.0
+            upto = time.time() - EXPORT_LAG
+            rows = H["db_query"]("SELECT id, t0, coin, lvl, sg, data FROM alt_rec WHERE t0 > ? AND t0 <= ? ORDER BY t0", (since, upto))
+            if not rows:
+                tg("no new alts rows yet")
+                return True
+            out = [(r["id"], r["t0"], r["coin"], r["lvl"], r["sg"], zlib.decompress(r["data"]).decode()) for r in rows]
+            ok = True
+            parts = [out[i:i + EXPORT_ROWS] for i in range(0, len(out), EXPORT_ROWS)]
+            for i, part in enumerate(parts):
+                nm = "alt_rec.csv.gz" if len(parts) == 1 else f"alt_rec_part{i + 1}.csv.gz"
+                ok = _send(nm, part, ["id", "t0", "coin", "lvl", "sg", "data"],
+                           f"{len(part)} alt jump rows ({i + 1}/{len(parts)})") and ok
+            mk = H["db_query"]("SELECT coin, tf, open_ts, bn_open, tw_strike, tw_src, outcome FROM alt_mkts "
+                               "WHERE outcome IS NOT NULL ORDER BY open_ts")
+            ok = _send("alt_mkts.csv.gz", mk, ["coin", "tf", "open_ts", "bn_open", "tw_strike", "tw_src", "outcome"],
+                       f"{len(mk)} market results") and ok
+            if ok:
+                H["db_exec"]("INSERT OR REPLACE INTO e2_kv (k, v) VALUES (?, ?)", (key, str(upto)))
+            else:
+                tg("⚠️ alts upload failed — nothing marked as sent, try again (or add 'all')")
+            return True
+        return False
+
+    def start(db_exec, db_query, token, chat):
+        H.update(db_exec=db_exec, db_query=db_query, token=token, chat=chat)
+        db_exec("CREATE TABLE IF NOT EXISTS alt_rec (id INTEGER PRIMARY KEY AUTOINCREMENT, t0 REAL, coin TEXT, lvl REAL, sg INTEGER, data BLOB)")
+        db_exec("CREATE INDEX IF NOT EXISTS alt_rec_t0 ON alt_rec (t0)")
+        db_exec("CREATE TABLE IF NOT EXISTS alt_mkts (coin TEXT, tf INTEGER, open_ts INTEGER, bn_open REAL, tw_strike REAL, "
+                "tw_src TEXT, outcome TEXT, PRIMARY KEY (coin, tf, open_ts))")
+        db_exec("CREATE TABLE IF NOT EXISTS e2_kv (k TEXT PRIMARY KEY, v TEXT)")
+        for fn in (market_worker, pm_worker, outcome_worker):
+            threading.Thread(target=fn, daemon=True).start()
+        for nm in FEEDS:
+            threading.Thread(target=feed_worker, args=(nm,), daemon=True).start()
+        for c in MKT:
+            for tw in (False, True):
+                threading.Thread(target=cl_worker, args=(c, tw), daemon=True).start()
+        log.info(f"alts recorder started: markets {MKT}, own {OWN}, lead {LEAD}")
+    return types.SimpleNamespace(**dict(locals()))
+
+
 def main():
     init_db()
     for fn in (resolver_worker, pm_worker, bn_worker, settler, telegram_worker, balance_worker, keep_warm):
@@ -2650,6 +3186,15 @@ def main():
             E2_ON = True
         except Exception as e:
             log.warning(f"early2 not started: {e}")
+    global ALT_ON
+    if os.environ.get("ALT_LOG", "true").strip().lower() in ("1", "true", "yes", "on"):
+        try:                                           # SOL/XRP/ETH long-shot recorder (paper only)
+            global alts
+            alts = _make_alts(lambda: clob().creds)
+            alts.start(db_exec, db_query, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+            ALT_ON = True
+        except Exception as e:
+            log.warning(f"alts not started: {e}")
     bal = ""
     if LIVE_ENABLED or (D_ON and D_LIVE):
         try:
@@ -2658,6 +3203,7 @@ def main():
             bal = f" · ⚠️ couldn't connect to Polymarket: {str(e)[:150]}"
     tg(f"⚡ 50secmaker started — old jump sniper {'OFF' if not JUMPER_ON else ('🟢 LIVE' if LIVE_ENABLED else '📝 PAPER')} · "
        f"${LIVE_STAKE:g}/trade{bal}. Send /status."
+       + (f"\n🛰 alts recorder ON ({', '.join(alts.MKT)}) · /altstatus" if ALT_ON else "")
        + (f"\n🎯 D rules: {'🟢 LIVE' if D_LIVE else '📝 paper'} · 5m {D_RULE[5]} · 15m {D_RULE[15]} · ${D_STAKE:g} · /dstatus" if D_ON else ""))
     while True:
         time.sleep(60)
