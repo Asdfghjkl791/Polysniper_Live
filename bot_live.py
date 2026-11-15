@@ -33,7 +33,7 @@ import types
 E2_ON = False
 early2 = None                                  # second early logger, built in main()
 ALT_ON = False
-alts = None                                    # SOL/XRP/ETH long-shot recorder, built in main()
+alts = None                                    # SOL/XRP/BNB/ETH long-shot recorder, built in main()
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -2193,7 +2193,7 @@ def telegram_worker():
                         tg("no signals yet")
                 elif t in ("/help", "/start"):
                     tg("⚡ live BTC jump sniper\n/status — settings + today\n/trades — last signals\n/today · /all — totals\n"
-                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/altstatus — SOL/XRP/ETH long-shot recorder health + Polymarket book delay\n/altexport — SOL/XRP/ETH jump rows + results, new rows (add 'all' for everything)\n/deribitexport — Deribit skew/same-day vol/perp/trades log (1/min)\n/extraexport — extra recorder: window books, PM trades, market info, Binance stats, new rows (add 'all' for everything)\n/extrastatus — extra + lead recorder health\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
+                       "/balance — USDC in the account\n/ping — network speed to Polymarket\n/stop — pause live trading · /go — resume\n/export — all signals (CSV)\n/earlyexport — early-move log (paper research)\n/closeexport — last 10s of every window (paper research)\n/ethexport — ETH early-move log, new rows (add 'all' for everything)\n/early2export — BTC+ETH 2bp/3bp early log, new rows\n/early2status — early2 logger health\n/altstatus — SOL/XRP/BNB/ETH long-shot recorder health + Polymarket book delay\n/altexport — SOL/XRP/BNB/ETH jump rows + results, new rows (add 'all' for everything)\n/deribitexport — Deribit skew/same-day vol/perp/trades log (1/min)\n/extraexport — extra recorder: window books, PM trades, market info, Binance stats, new rows (add 'all' for everything)\n/extrastatus — extra + lead recorder health\n/dstatus — D rules (hold-to-end) settings + today\n/dstop · /dgo — pause / resume D rules\n/dall — D rules all-time")
         except Exception as e:
             log.warning(f"telegram: {e}")
             time.sleep(5)
@@ -2626,7 +2626,7 @@ def _make_early2():
     return types.SimpleNamespace(**dict(locals()))   # start, handle, st, ... (everything defined above)
 
 
-# ── alts: SOL / XRP / ETH long-shot recorder (paper research only, NEVER trades) ─────────────────────
+# ── alts: SOL / XRP / BNB / ETH long-shot recorder (paper research only, NEVER trades) ─────────────────────
 # Added Nov 13 2026. Two questions:
 #   1. own-jump long shots on SOL and XRP: SOL (or XRP) moves >= 2/3/5bp within 2s on Binance -> that coin's 5m + 15m books
 #   2. follow-BTC long shots: BTC moves >= 2/3/5bp -> the ETH, SOL and XRP 5m + 15m books, before they catch up
@@ -2634,20 +2634,20 @@ def _make_early2():
 # Binance price at the same moments, and two fair prices for UP (Binance-open rule and the Chainlink 60s-TWAP rule, our vol).
 # It also measures how late the Polymarket books are (Polymarket's own message time vs when we got it) -> /altstatus.
 # Telegram:  /altstatus   /altexport [all]
-# Env (all optional): ALT_LOG (true) · ALT_MKTS ("ETH,SOL,XRP") · ALT_OWN ("SOL,XRP") · ALT_LEAD ("BTC") · ALT_KEEP_DAYS (10)
+# Env (all optional): ALT_LOG (true) · ALT_MKTS ("ETH,SOL,XRP,BNB") · ALT_OWN ("SOL,XRP,BNB") · ALT_LEAD ("BTC") · ALT_KEEP_DAYS (10)
 def _make_alts(get_creds):
     import os, time, json, math, threading, logging, requests, csv, io, gzip, zlib, statistics
     from collections import deque
     import websocket
 
     log = logging.getLogger("alts")
-    SYMS = {"BTC": "btcusdt", "ETH": "ethusdt", "SOL": "solusdt", "XRP": "xrpusdt"}
+    SYMS = {"BTC": "btcusdt", "ETH": "ethusdt", "SOL": "solusdt", "XRP": "xrpusdt", "BNB": "bnbusdt"}
 
     def _coins(k, d):
         return [c.strip().upper() for c in os.environ.get(k, d).split(",") if c.strip().upper() in SYMS]
 
-    MKT = _coins("ALT_MKTS", "ETH,SOL,XRP")          # coins whose Polymarket books we keep
-    OWN = [c for c in _coins("ALT_OWN", "SOL,XRP") if c in MKT]   # own jumps -> that coin's markets
+    MKT = _coins("ALT_MKTS", "ETH,SOL,XRP,BNB")          # coins whose Polymarket books we keep
+    OWN = [c for c in _coins("ALT_OWN", "SOL,XRP,BNB") if c in MKT]   # own jumps -> that coin's markets
     LEAD = _coins("ALT_LEAD", "BTC")                  # leader jumps -> every coin in MKT
     COINS = sorted(set(MKT) | set(OWN) | set(LEAD))
     KEEP_DAYS = float(os.environ.get("ALT_KEEP_DAYS", "10"))
@@ -3188,7 +3188,7 @@ def main():
             log.warning(f"early2 not started: {e}")
     global ALT_ON
     if os.environ.get("ALT_LOG", "true").strip().lower() in ("1", "true", "yes", "on"):
-        try:                                           # SOL/XRP/ETH long-shot recorder (paper only)
+        try:                                           # SOL/XRP/BNB/ETH long-shot recorder (paper only)
             global alts
             alts = _make_alts(lambda: clob().creds)
             alts.start(db_exec, db_query, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
